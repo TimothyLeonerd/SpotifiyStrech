@@ -1,0 +1,4 @@
+spotify-recorder
+*.o
+*.wav
+third_party/rubberband/build/

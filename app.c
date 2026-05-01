@@ -11,9 +11,12 @@
 #include <pulse/stream.h>
 #include <pulse/simple.h>
 
+#include "third_party/rubberband/rubberband/rubberband-c.h"
+
 typedef enum {
   MODE_IDLE = 0,
   MODE_RECORDING,
+  MODE_PREPARING,
   MODE_PLAYING,
   MODE_PAUSED,
 } AppMode;
@@ -57,6 +60,7 @@ typedef struct {
 static const char *mode_to_text(AppMode mode) {
   switch (mode) {
     case MODE_RECORDING: return "Recording";
+    case MODE_PREPARING: return "Preparing";
     case MODE_PLAYING: return "Playing";
     case MODE_PAUSED: return "Paused";
     case MODE_IDLE:
@@ -91,6 +95,10 @@ static void update_button_sensitivity(Recorder *r) {
       play_pause_label = "Play";
       break;
     case MODE_RECORDING:
+      stop_enabled = TRUE;
+      play_pause_label = "Play";
+      break;
+    case MODE_PREPARING:
       stop_enabled = TRUE;
       play_pause_label = "Play";
       break;
@@ -430,16 +438,21 @@ static gboolean playhead_tick_cb(GtkWidget *widget, GdkFrameClock *frame_clock, 
   (void)frame_clock;
   Recorder *r = user_data;
   gboolean scrubbing = FALSE;
+  gboolean playing = FALSE;
 
   g_mutex_lock(&r->mutex);
   scrubbing = r->scrubbing;
+  playing = (r->mode == MODE_PLAYING);
   g_mutex_unlock(&r->mutex);
 
   if (scrubbing) {
     return G_SOURCE_CONTINUE;
   }
 
-  update_display_playhead(r);
+  if (playing) {
+    update_display_playhead(r);
+  }
+
   update_time_label(r);
   gtk_widget_queue_draw(r->waveform_base);
   return G_SOURCE_CONTINUE;
@@ -464,6 +477,160 @@ static inline gint16 clamp_i16(gint32 value) {
     return -32768;
   }
   return (gint16)value;
+}
+
+static gboolean playback_should_stop(Recorder *rec) {
+  gboolean stop_requested = FALSE;
+
+  g_mutex_lock(&rec->mutex);
+  stop_requested = rec->playback_stop_requested;
+  g_mutex_unlock(&rec->mutex);
+
+  return stop_requested;
+}
+
+static void interleave_float_planes_to_s16(GByteArray *out, const float *const *planes, guint frames, guint channels) {
+  gsize start = out->len;
+  gint16 *dst;
+
+  g_byte_array_set_size(out, start + (gsize)frames * channels * sizeof(gint16));
+  dst = (gint16 *)(out->data + start);
+
+  for (guint i = 0; i < frames; ++i) {
+    for (guint c = 0; c < channels; ++c) {
+      float sample = planes[c][i];
+      if (sample > 1.0f) {
+        sample = 1.0f;
+      } else if (sample < -1.0f) {
+        sample = -1.0f;
+      }
+      dst[(gsize)i * channels + c] = clamp_i16((gint32)lrintf(sample * 32767.0f));
+    }
+  }
+}
+
+static gboolean fill_float_planes_from_s16(const guint8 *src, guint64 start_frame, guint frames, guint channels, float **planes) {
+  const gint16 *input = (const gint16 *)src;
+
+  for (guint i = 0; i < frames; ++i) {
+    const gint16 *frame = input + (((gsize)start_frame + i) * channels);
+    for (guint c = 0; c < channels; ++c) {
+      planes[c][i] = (float)frame[c] / 32768.0f;
+    }
+  }
+
+  return TRUE;
+}
+
+static GByteArray *render_stretched_pcm(Recorder *rec,
+                                        const GByteArray *snapshot,
+                                        guint sample_rate,
+                                        guint channels,
+                                        guint64 start_frame,
+                                        double speed,
+                                        gboolean *cancelled) {
+  const guint frame_size = channels * sizeof(gint16);
+  const guint64 total_frames = snapshot->len / frame_size;
+  const guint64 input_frames = (start_frame < total_frames) ? (total_frames - start_frame) : 0;
+  const guint chunk_frames = 1024;
+  const RubberBandOptions options = RubberBandOptionProcessOffline |
+                                    RubberBandOptionEngineFiner |
+                                    RubberBandOptionChannelsTogether;
+  RubberBandState state = NULL;
+  GByteArray *output = NULL;
+  float **input_planes = NULL;
+  float *input_storage = NULL;
+  float **output_planes = NULL;
+  float *output_storage = NULL;
+  guint output_capacity = 0;
+  gboolean cancelled_local = FALSE;
+
+  if (cancelled) {
+    *cancelled = FALSE;
+  }
+
+  if (input_frames == 0) {
+    return g_byte_array_new();
+  }
+
+  state = rubberband_new(sample_rate, channels, options, (speed > 0.0) ? (1.0 / speed) : 1.0, 1.0);
+  if (!state) {
+    set_error(rec, "Failed to create Rubber Band stretcher");
+    return NULL;
+  }
+
+  rubberband_set_expected_input_duration(state, (unsigned int)MIN(input_frames, (guint64)G_MAXUINT));
+
+  output = g_byte_array_new();
+  input_storage = g_new(float, chunk_frames * channels);
+  input_planes = g_new0(float *, channels);
+  output_planes = g_new0(float *, channels);
+
+  for (guint c = 0; c < channels; ++c) {
+    input_planes[c] = input_storage + (c * chunk_frames);
+  }
+
+  for (guint pass = 0; pass < 2; ++pass) {
+    guint64 offset = 0;
+
+    while (offset < input_frames) {
+      guint frames = (guint)MIN((guint64)chunk_frames, input_frames - offset);
+      gboolean final = (offset + frames) >= input_frames;
+
+      if (playback_should_stop(rec)) {
+        cancelled_local = TRUE;
+        goto cleanup;
+      }
+
+      fill_float_planes_from_s16(snapshot->data, start_frame + offset, frames, channels, input_planes);
+
+      if (pass == 0) {
+        rubberband_study(state, (const float *const *)input_planes, frames, final);
+      } else {
+        rubberband_process(state, (const float *const *)input_planes, frames, final);
+
+        while (rubberband_available(state) > 0) {
+          guint avail = (guint)rubberband_available(state);
+
+          if (avail > output_capacity) {
+            g_free(output_storage);
+            output_storage = g_new(float, (gsize)avail * channels);
+            for (guint c = 0; c < channels; ++c) {
+              output_planes[c] = output_storage + (c * avail);
+            }
+            output_capacity = avail;
+          }
+
+          rubberband_retrieve(state, (float *const *)output_planes, avail);
+          interleave_float_planes_to_s16(output, (const float *const *)output_planes, avail, channels);
+        }
+      }
+
+      offset += frames;
+    }
+
+    if (pass == 0) {
+      rubberband_calculate_stretch(state);
+    }
+  }
+
+cleanup:
+  rubberband_delete(state);
+  g_free(input_storage);
+  g_free(input_planes);
+  g_free(output_storage);
+  g_free(output_planes);
+
+  if (cancelled) {
+    *cancelled = cancelled_local;
+  }
+
+  if (cancelled_local) {
+    g_byte_array_unref(output);
+    return NULL;
+  }
+
+  return output;
 }
 
 typedef struct {
@@ -748,21 +915,24 @@ cleanup:
 static gpointer playback_thread_main(gpointer user_data) {
   Recorder *rec = user_data;
   GByteArray *snapshot = g_byte_array_new();
+  GByteArray *rendered = NULL;
   guint sample_rate = 44100;
   guint channels = 2;
   gdouble speed = 1.0;
   gdouble cursor_frames = 0.0;
-  gdouble src_pos = 0.0;
+  guint64 start_frame = 0;
+  guint64 input_frames = 0;
+  guint64 rendered_frames = 0;
+  guint64 output_frames_played = 0;
+  gdouble input_progress_ratio = 1.0;
   pa_threaded_mainloop *ml = NULL;
   pa_context *context = NULL;
   pa_stream *stream = NULL;
   pa_sample_spec ss;
   pa_buffer_attr attr;
-  guint8 *out_buffer = NULL;
-  const guint out_frames_per_chunk = 128;
-  const guint out_bytes_per_chunk = out_frames_per_chunk * channels * sizeof(gint16);
   gboolean reached_end = FALSE;
   gboolean flush_on_exit = FALSE;
+  gboolean cancelled = FALSE;
   PulseQuery query = {0};
 
   g_printerr("[playback] thread started\n");
@@ -775,13 +945,40 @@ static gpointer playback_thread_main(gpointer user_data) {
   channels = rec->channels;
   speed = rec->speed;
   cursor_frames = rec->playback_cursor_frames;
-  src_pos = cursor_frames;
   g_mutex_unlock(&rec->mutex);
 
   if (snapshot->len == 0) {
     set_error(rec, "Nothing to play yet");
     goto cleanup;
   }
+
+  {
+    const guint64 total_frames = snapshot->len / (channels * sizeof(gint16));
+    if (cursor_frames < 0.0) {
+      cursor_frames = 0.0;
+    }
+    if (cursor_frames > (gdouble)total_frames) {
+      cursor_frames = (gdouble)total_frames;
+    }
+    start_frame = (guint64)cursor_frames;
+    input_frames = total_frames - start_frame;
+  }
+
+  rendered = render_stretched_pcm(rec, snapshot, sample_rate, channels, start_frame, speed, &cancelled);
+  if (cancelled) {
+    goto cleanup;
+  }
+  if (!rendered) {
+    goto cleanup;
+  }
+
+  rendered_frames = rendered->len / (channels * sizeof(gint16));
+  if (rendered_frames == 0) {
+    set_error(rec, "Rubber Band produced no playback audio");
+    goto cleanup;
+  }
+
+  input_progress_ratio = (gdouble)input_frames / (gdouble)rendered_frames;
 
   ss.format = PA_SAMPLE_S16LE;
   ss.rate = sample_rate;
@@ -873,59 +1070,72 @@ static gpointer playback_thread_main(gpointer user_data) {
 
   g_printerr("[playback] opened async stream at %.1fx\n", speed);
 
-  out_buffer = g_malloc(out_bytes_per_chunk);
-  const guint frame_size = channels * sizeof(gint16);
-  const guint64 total_frames = snapshot->len / frame_size;
-
-  while (src_pos < (gdouble)(total_frames - 1)) {
-    gboolean stop_requested;
-
-    stop_requested = rec->playback_stop_requested;
-    while (!stop_requested && pa_stream_writable_size(stream) == 0) {
-      pa_threaded_mainloop_wait(ml);
-      stop_requested = rec->playback_stop_requested;
-    }
-
-    if (stop_requested) {
-      flush_on_exit = TRUE;
-      break;
-    }
-
-    guint writable = pa_stream_writable_size(stream);
-    guint out_frames = MIN(out_frames_per_chunk, writable / frame_size);
-    if (out_frames == 0) {
-      continue;
-    }
-
-    for (guint i = 0; i < out_frames && src_pos < (gdouble)(total_frames - 1); i++) {
-      guint64 base = (guint64)src_pos;
-      gdouble frac = src_pos - (gdouble)base;
-      const gint16 *a = (const gint16 *)(snapshot->data + (base * frame_size));
-      const gint16 *b = a + channels;
-      gint16 *dst = (gint16 *)(out_buffer + (i * frame_size));
-
-      for (guint c = 0; c < channels; c++) {
-        gdouble sample = (1.0 - frac) * (gdouble)a[c] + frac * (gdouble)b[c];
-        dst[c] = clamp_i16((gint32)lrint(sample));
-      }
-
-      src_pos += speed;
-    }
-
-    if (pa_stream_write(stream, out_buffer, out_frames * frame_size, NULL, 0, PA_SEEK_RELATIVE) < 0) {
-      set_error(rec, "PulseAudio playback write failed");
-      break;
-    }
+  {
+    const guint frame_size = channels * sizeof(gint16);
+    const guint8 *rendered_data = rendered->data;
 
     g_mutex_lock(&rec->mutex);
-    rec->playback_cursor_frames = src_pos;
-    rec->playback_anchor_frames = rec->playback_cursor_frames;
+    rec->playback_cursor_frames = cursor_frames;
+    rec->playback_anchor_frames = cursor_frames;
     rec->playback_anchor_us = g_get_monotonic_time();
+    rec->display_playhead_frames = cursor_frames;
+    rec->mode = MODE_PLAYING;
     g_mutex_unlock(&rec->mutex);
-  }
+    g_idle_add(refresh_ui_idle_cb, rec);
 
-  if (src_pos >= (gdouble)(total_frames - 1)) {
-    reached_end = TRUE;
+    while (output_frames_played < rendered_frames) {
+      gboolean stop_requested;
+
+      stop_requested = playback_should_stop(rec);
+      while (!stop_requested && pa_stream_writable_size(stream) == 0) {
+        pa_threaded_mainloop_wait(ml);
+        stop_requested = playback_should_stop(rec);
+      }
+
+      if (stop_requested) {
+        flush_on_exit = TRUE;
+        break;
+      }
+
+      guint writable = pa_stream_writable_size(stream);
+      guint out_frames = MIN(128u, writable / frame_size);
+      if (out_frames == 0) {
+        continue;
+      }
+
+      if (output_frames_played + out_frames > rendered_frames) {
+        out_frames = (guint)(rendered_frames - output_frames_played);
+      }
+
+      if (out_frames == 0) {
+        break;
+      }
+
+      if (pa_stream_write(stream,
+                          rendered_data + (output_frames_played * frame_size),
+                          out_frames * frame_size,
+                          NULL,
+                          0,
+                          PA_SEEK_RELATIVE) < 0) {
+        set_error(rec, "PulseAudio playback write failed");
+        break;
+      }
+
+      output_frames_played += out_frames;
+
+      g_mutex_lock(&rec->mutex);
+      rec->playback_cursor_frames = cursor_frames + ((gdouble)output_frames_played * input_progress_ratio);
+      if (rec->playback_cursor_frames > (gdouble)(start_frame + input_frames)) {
+        rec->playback_cursor_frames = (gdouble)(start_frame + input_frames);
+      }
+      rec->playback_anchor_frames = rec->playback_cursor_frames;
+      rec->playback_anchor_us = g_get_monotonic_time();
+      g_mutex_unlock(&rec->mutex);
+    }
+
+    if (output_frames_played >= rendered_frames) {
+      reached_end = TRUE;
+    }
   }
 
   if (flush_on_exit) {
@@ -962,8 +1172,10 @@ fail_locked:
   pa_threaded_mainloop_unlock(ml);
 
 cleanup:
-  g_free(out_buffer);
   g_byte_array_unref(snapshot);
+  if (rendered) {
+    g_byte_array_unref(rendered);
+  }
 
   if (ml) {
     pa_threaded_mainloop_stop(ml);
@@ -978,13 +1190,15 @@ cleanup:
 
   g_mutex_lock(&rec->mutex);
   rec->playback_ml = NULL;
-  rec->playback_cursor_frames = reached_end ? 0.0 : src_pos;
+  rec->playback_cursor_frames = reached_end ? 0.0 : (cursor_frames + ((gdouble)output_frames_played * input_progress_ratio));
   rec->playback_anchor_frames = rec->playback_cursor_frames;
   rec->playback_anchor_us = g_get_monotonic_time();
   if (!flush_on_exit) {
     rec->display_playhead_frames = rec->playback_cursor_frames;
   }
   if (reached_end) {
+    rec->mode = MODE_IDLE;
+  } else if (rec->mode == MODE_PREPARING) {
     rec->mode = MODE_IDLE;
   }
   rec->playback_running = FALSE;
@@ -1039,7 +1253,7 @@ static gboolean start_playback_thread(Recorder *r) {
 
   r->playback_stop_requested = FALSE;
   r->playback_running = TRUE;
-  r->mode = MODE_PLAYING;
+  r->mode = MODE_PREPARING;
   r->playback_anchor_frames = r->playback_cursor_frames;
   r->playback_anchor_us = g_get_monotonic_time();
   r->display_playhead_frames = r->playback_cursor_frames;
@@ -1190,12 +1404,22 @@ static void on_play_pause_clicked(GtkButton *button, gpointer user_data) {
 static void on_speed_changed(GtkRange *range, gpointer user_data) {
   Recorder *r = user_data;
   gdouble speed = gtk_range_get_value(range);
+  gboolean restart_playback = FALSE;
 
   g_mutex_lock(&r->mutex);
   r->speed = speed;
+  restart_playback = (r->mode == MODE_PLAYING);
   g_mutex_unlock(&r->mutex);
 
   update_speed_label(r, speed);
+
+  if (restart_playback) {
+    stop_playback_thread(r, FALSE);
+    if (!start_playback_thread(r)) {
+      set_error(r, "Failed to restart playback at new speed");
+      refresh_ui(r);
+    }
+  }
 }
 
 static gboolean on_waveform_base_draw(GtkWidget *widget, cairo_t *cr, gpointer user_data) {
