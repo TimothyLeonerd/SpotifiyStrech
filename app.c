@@ -23,7 +23,6 @@ typedef struct {
   GtkWidget *speed_value_label;
   GtkWidget *time_label;
   GtkWidget *waveform_base;
-  GtkWidget *playhead_overlay;
   GtkWidget *record_button;
   GtkWidget *play_pause_button;
   GtkWidget *stop_button;
@@ -39,6 +38,8 @@ typedef struct {
   gdouble playback_anchor_frames;
   gint64 playback_anchor_us;
   gdouble display_playhead_frames;
+  gboolean scrubbing;
+  gboolean resume_after_scrub;
 
   AppMode mode;
   gboolean stop_requested;
@@ -120,9 +121,12 @@ static void set_mode(Recorder *r, AppMode mode) {
 
 static gdouble get_current_playback_frames(Recorder *r);
 static double get_playhead_ratio(Recorder *r);
+static gboolean start_playback_thread(Recorder *r);
+static void stop_playback_thread(Recorder *r, gboolean reset_cursor);
 
 static void update_display_playhead(Recorder *r) {
   AppMode mode;
+  gboolean scrubbing = FALSE;
   gdouble current_frames = 0.0;
   gdouble display_frames = 0.0;
 
@@ -130,8 +134,11 @@ static void update_display_playhead(Recorder *r) {
 
   g_mutex_lock(&r->mutex);
   mode = r->mode;
+  scrubbing = r->scrubbing;
   display_frames = r->display_playhead_frames;
-  if (mode == MODE_PLAYING) {
+  if (scrubbing) {
+    display_frames = current_frames;
+  } else if (mode == MODE_PLAYING) {
     gdouble delta = current_frames - display_frames;
     if (delta < 0.0) {
       delta = 0.0;
@@ -166,6 +173,7 @@ static void update_time_label(Recorder *r) {
 
 static gdouble get_current_playback_frames(Recorder *r) {
   AppMode mode;
+  gboolean scrubbing = FALSE;
   gdouble cursor_frames = 0.0;
   gdouble anchor_frames = 0.0;
   gint64 anchor_us = 0;
@@ -174,12 +182,17 @@ static gdouble get_current_playback_frames(Recorder *r) {
 
   g_mutex_lock(&r->mutex);
   mode = r->mode;
+  scrubbing = r->scrubbing;
   cursor_frames = r->playback_cursor_frames;
   anchor_frames = r->playback_anchor_frames;
   anchor_us = r->playback_anchor_us;
   rate = r->sample_rate ? r->sample_rate : 1;
   speed = r->speed;
   g_mutex_unlock(&r->mutex);
+
+  if (scrubbing) {
+    return cursor_frames;
+  }
 
   if (mode == MODE_PLAYING) {
     gdouble elapsed_sec = (g_get_monotonic_time() - anchor_us) / 1000000.0;
@@ -226,8 +239,8 @@ static void refresh_ui(Recorder *r) {
   gtk_widget_queue_draw(r->waveform_base);
 
   {
-    gint width = gtk_widget_get_allocated_width(r->playhead_overlay);
-    gint height = gtk_widget_get_allocated_height(r->playhead_overlay);
+    gint width = gtk_widget_get_allocated_width(r->waveform_base);
+    gint height = gtk_widget_get_allocated_height(r->waveform_base);
     gint new_x = (gint)lrint(get_playhead_ratio(r) * (double)width);
     gint old_x = r->last_playhead_x;
     gint x1 = MIN(old_x, new_x) - 6;
@@ -237,11 +250,155 @@ static void refresh_ui(Recorder *r) {
       if (x1 < 0) x1 = 0;
       if (x2 > width) x2 = width;
       if (x2 > x1) {
-        gtk_widget_queue_draw_area(r->playhead_overlay, x1, 0, x2 - x1, height);
+        gtk_widget_queue_draw_area(r->waveform_base, x1, 0, x2 - x1, height);
       }
     }
 
     r->last_playhead_x = new_x;
+  }
+}
+
+static void seek_to_fraction(Recorder *r, double fraction) {
+  AppMode mode;
+  gboolean scrubbing = FALSE;
+  gdouble total_frames = 0.0;
+  gdouble target_frames = 0.0;
+
+  if (fraction < 0.0) {
+    fraction = 0.0;
+  }
+  if (fraction > 1.0) {
+    fraction = 1.0;
+  }
+
+  g_mutex_lock(&r->mutex);
+  mode = r->mode;
+  scrubbing = r->scrubbing;
+  total_frames = (gdouble)r->captured_frames;
+  target_frames = total_frames * fraction;
+  r->playback_cursor_frames = target_frames;
+  r->playback_anchor_frames = target_frames;
+  r->playback_anchor_us = g_get_monotonic_time();
+  r->display_playhead_frames = target_frames;
+  g_mutex_unlock(&r->mutex);
+
+  g_printerr("[seek] fraction=%.3f target_frames=%.1f mode=%d\n", fraction, target_frames, mode);
+
+  if (mode == MODE_PLAYING && !scrubbing) {
+    stop_playback_thread(r, FALSE);
+    if (!start_playback_thread(r)) {
+      return;
+    }
+  } else {
+    refresh_ui(r);
+  }
+}
+
+static gboolean grab_scrub_pointer(GtkWidget *widget, GdkEventButton *event) {
+  GdkWindow *window = gtk_widget_get_window(widget);
+  GdkDevice *device = gdk_event_get_device((GdkEvent *)event);
+  GdkSeat *seat;
+
+  if (!window || !device) {
+    return FALSE;
+  }
+
+  seat = gdk_device_get_seat(device);
+  if (!seat) {
+    return FALSE;
+  }
+
+  return gdk_seat_grab(seat,
+                       window,
+                       GDK_SEAT_CAPABILITY_POINTER,
+                       FALSE,
+                       NULL,
+                       (GdkEvent *)event,
+                       NULL,
+                       NULL) == GDK_GRAB_SUCCESS;
+}
+
+static void release_scrub_pointer(GtkWidget *widget, GdkEventButton *event) {
+  GdkWindow *window = gtk_widget_get_window(widget);
+  GdkDevice *device = gdk_event_get_device((GdkEvent *)event);
+  GdkSeat *seat;
+
+  (void)window;
+
+  if (!device) {
+    return;
+  }
+
+  seat = gdk_device_get_seat(device);
+  if (!seat) {
+    return;
+  }
+
+  gdk_seat_ungrab(seat);
+}
+
+static void begin_scrub(Recorder *r) {
+  gboolean was_playing = FALSE;
+
+  g_mutex_lock(&r->mutex);
+  if (r->scrubbing) {
+    g_mutex_unlock(&r->mutex);
+    return;
+  }
+  r->scrubbing = TRUE;
+  was_playing = (r->mode == MODE_PLAYING);
+  r->resume_after_scrub = was_playing;
+  g_mutex_unlock(&r->mutex);
+
+  g_printerr("[scrub] begin resume=%d\n", was_playing ? 1 : 0);
+  if (was_playing) {
+    stop_playback_thread(r, FALSE);
+  }
+}
+
+static void update_scrub(Recorder *r, double fraction) {
+  AppMode mode;
+  gdouble total_frames = 0.0;
+  gdouble target_frames = 0.0;
+
+  if (fraction < 0.0) {
+    fraction = 0.0;
+  }
+  if (fraction > 1.0) {
+    fraction = 1.0;
+  }
+
+  g_mutex_lock(&r->mutex);
+  mode = r->mode;
+  total_frames = (gdouble)r->captured_frames;
+  target_frames = total_frames * fraction;
+  r->playback_cursor_frames = target_frames;
+  r->playback_anchor_frames = target_frames;
+  r->playback_anchor_us = g_get_monotonic_time();
+  r->display_playhead_frames = target_frames;
+  g_mutex_unlock(&r->mutex);
+
+  g_printerr("[scrub] fraction=%.3f target_frames=%.1f mode=%d\n", fraction, target_frames, mode);
+  update_time_label(r);
+  gtk_widget_queue_draw(r->waveform_base);
+}
+
+static void end_scrub(Recorder *r) {
+  gboolean resume = FALSE;
+
+  g_mutex_lock(&r->mutex);
+  if (!r->scrubbing) {
+    g_mutex_unlock(&r->mutex);
+    return;
+  }
+  r->scrubbing = FALSE;
+  resume = r->resume_after_scrub;
+  r->resume_after_scrub = FALSE;
+  g_mutex_unlock(&r->mutex);
+
+  g_printerr("[scrub] end resume=%d\n", resume ? 1 : 0);
+  if (resume) {
+    start_playback_thread(r);
   }
 }
 
@@ -272,9 +429,19 @@ static gboolean playhead_tick_cb(GtkWidget *widget, GdkFrameClock *frame_clock, 
   (void)widget;
   (void)frame_clock;
   Recorder *r = user_data;
+  gboolean scrubbing = FALSE;
+
+  g_mutex_lock(&r->mutex);
+  scrubbing = r->scrubbing;
+  g_mutex_unlock(&r->mutex);
+
+  if (scrubbing) {
+    return G_SOURCE_CONTINUE;
+  }
+
   update_display_playhead(r);
   update_time_label(r);
-  gtk_widget_queue_draw(r->playhead_overlay);
+  gtk_widget_queue_draw(r->waveform_base);
   return G_SOURCE_CONTINUE;
 }
 
@@ -817,12 +984,12 @@ cleanup:
   if (!flush_on_exit) {
     rec->display_playhead_frames = rec->playback_cursor_frames;
   }
+  if (reached_end) {
+    rec->mode = MODE_IDLE;
+  }
   rec->playback_running = FALSE;
   rec->playback_thread = NULL;
   rec->playback_stop_requested = FALSE;
-  if (rec->mode == MODE_PLAYING) {
-    rec->mode = MODE_IDLE;
-  }
   g_mutex_unlock(&rec->mutex);
 
   g_idle_add(refresh_ui_idle_cb, rec);
@@ -922,9 +1089,6 @@ static void stop_playback_thread(Recorder *r, gboolean reset_cursor) {
   r->playback_thread = NULL;
   r->playback_running = FALSE;
   r->playback_stop_requested = FALSE;
-  if (r->mode == MODE_PLAYING) {
-    r->mode = MODE_IDLE;
-  }
   g_mutex_unlock(&r->mutex);
 }
 
@@ -1086,29 +1250,82 @@ static gboolean on_waveform_base_draw(GtkWidget *widget, cairo_t *cr, gpointer u
   }
 
   cairo_stroke(cr);
+
+  {
+    double playhead_x = get_playhead_ratio(r) * width;
+    cairo_set_source_rgba(cr, 1.0, 0.55, 0.0, 0.16);
+    cairo_rectangle(cr, 0, 0, playhead_x, height);
+    cairo_fill(cr);
+
+    cairo_set_source_rgb(cr, 1.0, 0.55, 0.0);
+    cairo_set_line_width(cr, 3.0);
+    cairo_move_to(cr, playhead_x + 0.5, 0);
+    cairo_line_to(cr, playhead_x + 0.5, height);
+    cairo_stroke(cr);
+  }
+
   return FALSE;
 }
 
-static gboolean on_playhead_draw(GtkWidget *widget, cairo_t *cr, gpointer user_data) {
+static gboolean on_waveform_button_press(GtkWidget *widget, GdkEventButton *event, gpointer user_data) {
   Recorder *r = user_data;
   GtkAllocation allocation;
+  double fraction = 0.0;
+
+  if (event->button != 1) {
+    return FALSE;
+  }
+
   gtk_widget_get_allocation(widget, &allocation);
+  if (allocation.width <= 0) {
+    return FALSE;
+  }
 
-  const double width = allocation.width;
-  const double height = allocation.height;
+  begin_scrub(r);
+  if (!grab_scrub_pointer(widget, event)) {
+    g_printerr("[scrub] pointer grab failed\n");
+  }
+  fraction = event->x / (double)allocation.width;
+  g_printerr("[click] widget=%s x=%.1f width=%d fraction=%.3f\n", G_OBJECT_TYPE_NAME(widget), event->x, allocation.width, fraction);
+  seek_to_fraction(r, fraction);
+  return TRUE;
+}
 
-  double playhead_x = get_playhead_ratio(r) * width;
-  cairo_set_source_rgba(cr, 1.0, 0.55, 0.0, 0.16);
-  cairo_rectangle(cr, 0, 0, playhead_x, height);
-  cairo_fill(cr);
+static gboolean on_waveform_button_release(GtkWidget *widget, GdkEventButton *event, gpointer user_data) {
+  (void)widget;
+  Recorder *r = user_data;
 
-  cairo_set_source_rgb(cr, 1.0, 0.55, 0.0);
-  cairo_set_line_width(cr, 3.0);
-  cairo_move_to(cr, playhead_x + 0.5, 0);
-  cairo_line_to(cr, playhead_x + 0.5, height);
-  cairo_stroke(cr);
+  if (event->button != 1) {
+    return FALSE;
+  }
 
-  return FALSE;
+  release_scrub_pointer(widget, event);
+  end_scrub(r);
+  return TRUE;
+}
+
+static gboolean on_waveform_motion(GtkWidget *widget, GdkEventMotion *event, gpointer user_data) {
+  Recorder *r = user_data;
+  GtkAllocation allocation;
+  double x = event->x;
+  double fraction = 0.0;
+  gboolean scrubbing = FALSE;
+
+  g_mutex_lock(&r->mutex);
+  scrubbing = r->scrubbing;
+  g_mutex_unlock(&r->mutex);
+  if (!scrubbing) {
+    return FALSE;
+  }
+
+  gtk_widget_get_allocation(widget, &allocation);
+  if (allocation.width <= 0) {
+    return FALSE;
+  }
+
+  fraction = x / (double)allocation.width;
+  update_scrub(r, fraction);
+  return TRUE;
 }
 
 static void on_window_destroy(GtkWidget *widget, gpointer user_data) {
@@ -1116,7 +1333,7 @@ static void on_window_destroy(GtkWidget *widget, gpointer user_data) {
   Recorder *r = user_data;
 
   if (r->tick_callback_id) {
-    gtk_widget_remove_tick_callback(r->playhead_overlay, r->tick_callback_id);
+    gtk_widget_remove_tick_callback(r->waveform_base, r->tick_callback_id);
   }
 
   stop_playback_thread(r, TRUE);
@@ -1147,16 +1364,13 @@ static void activate(GtkApplication *app, gpointer user_data) {
   GtkWidget *speed_label = gtk_label_new("Playback speed");
   GtkWidget *speed_value = gtk_label_new("1.0x");
   GtkWidget *speed_scale = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, 0.5, 2.0, 0.1);
-  GtkWidget *waveform_overlay = gtk_overlay_new();
   GtkWidget *waveform_base = gtk_drawing_area_new();
-  GtkWidget *playhead_overlay = gtk_drawing_area_new();
   GtkWidget *time_label = gtk_label_new("0.0 / 0.0s");
   GtkWidget *status = gtk_label_new("Stopped | 0.0s captured");
 
   r->status_label = status;
   r->speed_value_label = speed_value;
   r->waveform_base = waveform_base;
-  r->playhead_overlay = playhead_overlay;
   r->time_label = time_label;
   r->record_button = record_button;
   r->play_pause_button = play_pause_button;
@@ -1191,22 +1405,15 @@ static void activate(GtkApplication *app, gpointer user_data) {
   gtk_box_pack_start(GTK_BOX(speed_row), speed_scale, TRUE, TRUE, 0);
   gtk_box_pack_start(GTK_BOX(speed_row), speed_value, FALSE, FALSE, 0);
 
-  gtk_widget_set_vexpand(waveform_overlay, TRUE);
-  gtk_widget_set_hexpand(waveform_overlay, TRUE);
-  gtk_widget_set_size_request(waveform_overlay, -1, 320);
   gtk_widget_set_vexpand(waveform_base, TRUE);
   gtk_widget_set_hexpand(waveform_base, TRUE);
-  gtk_widget_set_vexpand(playhead_overlay, TRUE);
-  gtk_widget_set_hexpand(playhead_overlay, TRUE);
-
-  gtk_container_add(GTK_CONTAINER(waveform_overlay), waveform_base);
-  gtk_overlay_add_overlay(GTK_OVERLAY(waveform_overlay), playhead_overlay);
-  gtk_overlay_set_overlay_pass_through(GTK_OVERLAY(waveform_overlay), playhead_overlay, TRUE);
+  gtk_widget_set_size_request(waveform_base, -1, 320);
+  gtk_widget_add_events(waveform_base, GDK_BUTTON_PRESS_MASK | GDK_BUTTON_RELEASE_MASK | GDK_BUTTON_MOTION_MASK | GDK_POINTER_MOTION_MASK);
 
   gtk_box_pack_start(GTK_BOX(root), title, FALSE, FALSE, 0);
   gtk_box_pack_start(GTK_BOX(root), controls, FALSE, FALSE, 0);
   gtk_box_pack_start(GTK_BOX(root), speed_row, FALSE, FALSE, 0);
-  gtk_box_pack_start(GTK_BOX(root), waveform_overlay, TRUE, TRUE, 0);
+  gtk_box_pack_start(GTK_BOX(root), waveform_base, TRUE, TRUE, 0);
   gtk_box_pack_start(GTK_BOX(root), time_label, FALSE, FALSE, 0);
   gtk_box_pack_start(GTK_BOX(root), status, FALSE, FALSE, 0);
 
@@ -1217,10 +1424,12 @@ static void activate(GtkApplication *app, gpointer user_data) {
   g_signal_connect(play_pause_button, "clicked", G_CALLBACK(on_play_pause_clicked), r);
   g_signal_connect(speed_scale, "value-changed", G_CALLBACK(on_speed_changed), r);
   g_signal_connect(waveform_base, "draw", G_CALLBACK(on_waveform_base_draw), r);
-  g_signal_connect(playhead_overlay, "draw", G_CALLBACK(on_playhead_draw), r);
+  g_signal_connect(waveform_base, "button-press-event", G_CALLBACK(on_waveform_button_press), r);
+  g_signal_connect(waveform_base, "button-release-event", G_CALLBACK(on_waveform_button_release), r);
+  g_signal_connect(waveform_base, "motion-notify-event", G_CALLBACK(on_waveform_motion), r);
   g_signal_connect(window, "destroy", G_CALLBACK(on_window_destroy), r);
 
-  r->tick_callback_id = gtk_widget_add_tick_callback(playhead_overlay, playhead_tick_cb, r, NULL);
+  r->tick_callback_id = gtk_widget_add_tick_callback(waveform_base, playhead_tick_cb, r, NULL);
   refresh_ui(r);
 
   gtk_widget_show_all(window);
