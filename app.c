@@ -300,6 +300,13 @@ static void refresh_ui(Recorder *r) {
   }
 }
 
+static void set_playback_cursor_locked(Recorder *r, gdouble frames) {
+  r->playback_cursor_frames = frames;
+  r->playback_anchor_frames = frames;
+  r->playback_anchor_us = g_get_monotonic_time();
+  r->display_playhead_frames = frames;
+}
+
 static void seek_to_fraction(Recorder *r, double fraction) {
   AppMode mode;
   gboolean scrubbing = FALSE;
@@ -318,10 +325,7 @@ static void seek_to_fraction(Recorder *r, double fraction) {
   scrubbing = r->scrubbing;
   total_frames = (gdouble)r->captured_frames;
   target_frames = total_frames * fraction;
-  r->playback_cursor_frames = target_frames;
-  r->playback_anchor_frames = target_frames;
-  r->playback_anchor_us = g_get_monotonic_time();
-  r->display_playhead_frames = target_frames;
+  set_playback_cursor_locked(r, target_frames);
   g_mutex_unlock(&r->mutex);
 
   g_printerr("[seek] fraction=%.3f target_frames=%.1f mode=%d\n", fraction, target_frames, mode);
@@ -414,10 +418,7 @@ static void update_scrub(Recorder *r, double fraction) {
   mode = r->mode;
   total_frames = (gdouble)r->captured_frames;
   target_frames = total_frames * fraction;
-  r->playback_cursor_frames = target_frames;
-  r->playback_anchor_frames = target_frames;
-  r->playback_anchor_us = g_get_monotonic_time();
-  r->display_playhead_frames = target_frames;
+  set_playback_cursor_locked(r, target_frames);
   g_mutex_unlock(&r->mutex);
 
   g_printerr("[scrub] fraction=%.3f target_frames=%.1f mode=%d\n", fraction, target_frames, mode);
@@ -1565,15 +1566,9 @@ static void stop_playback_thread(Recorder *r, gboolean reset_cursor) {
 
   g_mutex_lock(&r->mutex);
   if (reset_cursor) {
-    r->playback_cursor_frames = 0.0;
-    r->playback_anchor_frames = 0.0;
-    r->playback_anchor_us = g_get_monotonic_time();
-    r->display_playhead_frames = 0.0;
+    set_playback_cursor_locked(r, 0.0);
   } else {
-    r->playback_cursor_frames = preserved_display_frames;
-    r->playback_anchor_frames = preserved_display_frames;
-    r->playback_anchor_us = g_get_monotonic_time();
-    r->display_playhead_frames = preserved_display_frames;
+    set_playback_cursor_locked(r, preserved_display_frames);
   }
   r->playback_thread = NULL;
   r->playback_running = FALSE;
@@ -1605,9 +1600,15 @@ static void stop_capture_thread(Recorder *r, gboolean force_stopped) {
   g_mutex_unlock(&r->mutex);
 }
 
-static void on_record_clicked(GtkButton *button, gpointer user_data) {
-  (void)button;
-  Recorder *r = user_data;
+static void transport_stop(Recorder *r) {
+  g_printerr("[ui] stop clicked\n");
+  stop_playback_thread(r, TRUE);
+  stop_capture_thread(r, TRUE);
+  set_mode(r, MODE_IDLE);
+  refresh_ui(r);
+}
+
+static void transport_start_recording(Recorder *r) {
   gboolean should_start = FALSE;
   gboolean reset_buffers = FALSE;
 
@@ -1629,56 +1630,67 @@ static void on_record_clicked(GtkButton *button, gpointer user_data) {
   refresh_ui(r);
 }
 
-static void on_stop_clicked(GtkButton *button, gpointer user_data) {
-  (void)button;
-  Recorder *r = user_data;
-  g_printerr("[ui] stop clicked\n");
-  stop_playback_thread(r, TRUE);
+static gboolean transport_play_from_idle(Recorder *r) {
   stop_capture_thread(r, TRUE);
-  set_mode(r, MODE_IDLE);
-  refresh_ui(r);
+  return start_playback_thread(r);
 }
 
-static void on_play_pause_clicked(GtkButton *button, gpointer user_data) {
-  (void)button;
-  Recorder *r = user_data;
+static void transport_pause(Recorder *r) {
+  gdouble paused_frames = 0.0;
+
   g_mutex_lock(&r->mutex);
-  if (r->mode == MODE_IDLE) {
-    g_mutex_unlock(&r->mutex);
-    stop_capture_thread(r, TRUE);
-    if (!start_playback_thread(r)) {
-      return;
-    }
-  } else if (r->mode == MODE_PLAYING) {
-    gdouble paused_frames = r->display_playhead_frames;
-    r->mode = MODE_PAUSED;
-    r->playback_cursor_frames = paused_frames;
-    r->playback_anchor_frames = paused_frames;
-    r->playback_anchor_us = g_get_monotonic_time();
-    r->display_playhead_frames = paused_frames;
-    g_printerr("[ui] playback paused\n");
-    g_mutex_unlock(&r->mutex);
-    stop_playback_thread(r, FALSE);
-  } else if (r->mode == MODE_PAUSED) {
-    gdouble resumed_frames = r->display_playhead_frames;
-    r->playback_cursor_frames = resumed_frames;
-    r->playback_anchor_frames = r->playback_cursor_frames;
-    r->playback_anchor_us = g_get_monotonic_time();
-    g_printerr("[ui] playback resumed\n");
-    g_mutex_unlock(&r->mutex);
-    if (!start_playback_thread(r)) {
-      set_error(r, "Failed to resume playback");
-    }
-  } else {
-    g_mutex_unlock(&r->mutex);
-    return;
+  paused_frames = r->display_playhead_frames;
+  r->mode = MODE_PAUSED;
+  set_playback_cursor_locked(r, paused_frames);
+  g_printerr("[ui] playback paused\n");
+  g_mutex_unlock(&r->mutex);
+
+  stop_playback_thread(r, FALSE);
+}
+
+static void transport_resume(Recorder *r) {
+  gdouble resumed_frames = 0.0;
+
+  g_mutex_lock(&r->mutex);
+  resumed_frames = r->display_playhead_frames;
+  set_playback_cursor_locked(r, resumed_frames);
+  g_printerr("[ui] playback resumed\n");
+  g_mutex_unlock(&r->mutex);
+
+  if (!start_playback_thread(r)) {
+    set_error(r, "Failed to resume playback");
   }
+}
+
+static void transport_play_pause(Recorder *r) {
+  AppMode mode;
+
+  g_mutex_lock(&r->mutex);
+  mode = r->mode;
+  g_mutex_unlock(&r->mutex);
+
+  switch (mode) {
+    case MODE_IDLE:
+      if (!transport_play_from_idle(r)) {
+        return;
+      }
+      break;
+    case MODE_PLAYING:
+      transport_pause(r);
+      break;
+    case MODE_PAUSED:
+      transport_resume(r);
+      break;
+    case MODE_RECORDING:
+    case MODE_PREPARING:
+    default:
+      return;
+  }
+
   refresh_ui(r);
 }
 
-static void on_speed_changed(GtkRange *range, gpointer user_data) {
-  Recorder *r = user_data;
-  gdouble speed = gtk_range_get_value(range);
+static void transport_set_speed(Recorder *r, gdouble speed) {
   gboolean restart_playback = FALSE;
 
   g_mutex_lock(&r->mutex);
@@ -1695,6 +1707,30 @@ static void on_speed_changed(GtkRange *range, gpointer user_data) {
       refresh_ui(r);
     }
   }
+}
+
+static void on_record_clicked(GtkButton *button, gpointer user_data) {
+  (void)button;
+  Recorder *r = user_data;
+  transport_start_recording(r);
+}
+
+static void on_stop_clicked(GtkButton *button, gpointer user_data) {
+  (void)button;
+  Recorder *r = user_data;
+  transport_stop(r);
+}
+
+static void on_play_pause_clicked(GtkButton *button, gpointer user_data) {
+  (void)button;
+  Recorder *r = user_data;
+  transport_play_pause(r);
+}
+
+static void on_speed_changed(GtkRange *range, gpointer user_data) {
+  Recorder *r = user_data;
+  gdouble speed = gtk_range_get_value(range);
+  transport_set_speed(r, speed);
 }
 
 static void on_loop_toggled(GtkToggleButton *button, gpointer user_data) {
