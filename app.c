@@ -30,6 +30,15 @@ typedef enum {
 } LoopDragMode;
 
 typedef struct {
+  gboolean enabled;
+  gboolean explicit_region_set;
+  gboolean effective_region_set;
+  gdouble total_frames;
+  gdouble start_frames;
+  gdouble end_frames;
+} LoopSnapshot;
+
+typedef struct {
   GtkWidget *status_label;
   GtkWidget *speed_value_label;
   GtkWidget *time_label;
@@ -511,6 +520,58 @@ static gdouble clamp_loop_frame(Recorder *r, gdouble frame) {
     frame = total_frames;
   }
   return frame;
+}
+
+static gboolean get_effective_loop_region_locked(Recorder *r, gdouble total_frames, gdouble *start_frames, gdouble *end_frames) {
+  gdouble start = r->loop_region_set ? r->loop_start_frames : 0.0;
+  gdouble end = r->loop_region_set ? r->loop_end_frames : total_frames;
+
+  if (total_frames <= 0.0) {
+    return FALSE;
+  }
+
+  if (start < 0.0) {
+    start = 0.0;
+  }
+  if (end < 0.0) {
+    end = 0.0;
+  }
+  if (start > total_frames) {
+    start = total_frames;
+  }
+  if (end > total_frames) {
+    end = total_frames;
+  }
+  if (start > end) {
+    gdouble tmp = start;
+    start = end;
+    end = tmp;
+  }
+
+  if (start_frames) {
+    *start_frames = start;
+  }
+  if (end_frames) {
+    *end_frames = end;
+  }
+
+  return end > start;
+}
+
+static LoopSnapshot get_loop_snapshot(Recorder *r) {
+  LoopSnapshot snapshot = {0};
+
+  g_mutex_lock(&r->mutex);
+  snapshot.enabled = r->loop_enabled;
+  snapshot.explicit_region_set = r->loop_region_set;
+  snapshot.total_frames = (gdouble)r->captured_frames;
+  snapshot.effective_region_set = get_effective_loop_region_locked(r,
+                                                                    snapshot.total_frames,
+                                                                    &snapshot.start_frames,
+                                                                    &snapshot.end_frames);
+  g_mutex_unlock(&r->mutex);
+
+  return snapshot;
 }
 
 static void finalize_loop_region(Recorder *r, gdouble start_frames, gdouble end_frames) {
@@ -1215,6 +1276,8 @@ static gpointer playback_thread_main(gpointer user_data) {
       gboolean stop_requested;
       gboolean live_loop_enabled = FALSE;
       gboolean live_loop_region_set = FALSE;
+      gdouble live_loop_start = 0.0;
+      gdouble live_loop_end = 0.0;
       guint64 live_loop_start_frame = 0;
       guint64 live_loop_end_frame = 0;
       gboolean live_loop_valid = FALSE;
@@ -1223,23 +1286,11 @@ static gpointer playback_thread_main(gpointer user_data) {
 
       g_mutex_lock(&rec->mutex);
       live_loop_enabled = rec->loop_enabled;
-      live_loop_region_set = rec->loop_region_set || total_frames > 0;
-      if (live_loop_region_set) {
-        gdouble live_loop_start = rec->loop_region_set ? rec->loop_start_frames : 0.0;
-        gdouble live_loop_end = rec->loop_region_set ? rec->loop_end_frames : (gdouble)total_frames;
-        if (live_loop_start < 0.0) live_loop_start = 0.0;
-        if (live_loop_end < 0.0) live_loop_end = 0.0;
-        if (live_loop_start > (gdouble)total_frames) live_loop_start = (gdouble)total_frames;
-        if (live_loop_end > (gdouble)total_frames) live_loop_end = (gdouble)total_frames;
-        if (live_loop_start > live_loop_end) {
-          gdouble tmp = live_loop_start;
-          live_loop_start = live_loop_end;
-          live_loop_end = tmp;
-        }
-        live_loop_start_frame = (guint64)live_loop_start;
-        live_loop_end_frame = (guint64)live_loop_end;
-      }
+      live_loop_region_set = get_effective_loop_region_locked(rec, (gdouble)total_frames, &live_loop_start, &live_loop_end);
       g_mutex_unlock(&rec->mutex);
+
+      live_loop_start_frame = (guint64)live_loop_start;
+      live_loop_end_frame = (guint64)live_loop_end;
 
       live_loop_valid = live_loop_enabled && live_loop_region_set && live_loop_end_frame > live_loop_start_frame;
 
@@ -1657,13 +1708,20 @@ static void on_loop_toggled(GtkToggleButton *button, gpointer user_data) {
   refresh_ui(r);
 }
 
-static gboolean on_waveform_base_draw(GtkWidget *widget, cairo_t *cr, gpointer user_data) {
-  Recorder *r = user_data;
-  GtkAllocation allocation;
-  gtk_widget_get_allocation(widget, &allocation);
+static guint16 *copy_wave_peaks(Recorder *r, gsize *peak_count) {
+  guint16 *peaks = NULL;
 
-  const double width = allocation.width;
-  const double height = allocation.height;
+  g_mutex_lock(&r->mutex);
+  *peak_count = r->wave_peaks->len;
+  if (*peak_count > 0) {
+    peaks = g_memdup2(r->wave_peaks->data, *peak_count * sizeof *peaks);
+  }
+  g_mutex_unlock(&r->mutex);
+
+  return peaks;
+}
+
+static void draw_waveform_background(cairo_t *cr, double width, double height) {
   const double mid_y = height * 0.5;
 
   cairo_set_source_rgb(cr, 0.10, 0.10, 0.12);
@@ -1674,23 +1732,22 @@ static gboolean on_waveform_base_draw(GtkWidget *widget, cairo_t *cr, gpointer u
   cairo_move_to(cr, 0, mid_y);
   cairo_line_to(cr, width, mid_y);
   cairo_stroke(cr);
+}
 
-  g_mutex_lock(&r->mutex);
-  const guint16 *peaks = (const guint16 *)r->wave_peaks->data;
-  gsize peak_count = r->wave_peaks->len;
-  g_mutex_unlock(&r->mutex);
+static void draw_waveform_empty(cairo_t *cr, double width, double height) {
+  cairo_text_extents_t extents;
+  const char *text = "Waveform appears as you record";
 
-  if (peak_count == 0 || width <= 1.0) {
-    cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 0.65);
-    cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
-    cairo_set_font_size(cr, 18.0);
-    cairo_text_extents_t extents;
-    const char *text = "Waveform appears as you record";
-    cairo_text_extents(cr, text, &extents);
-    cairo_move_to(cr, (width - extents.width) * 0.5 - extents.x_bearing, (height - extents.height) * 0.5 - extents.y_bearing);
-    cairo_show_text(cr, text);
-    return FALSE;
-  }
+  cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 0.65);
+  cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+  cairo_set_font_size(cr, 18.0);
+  cairo_text_extents(cr, text, &extents);
+  cairo_move_to(cr, (width - extents.width) * 0.5 - extents.x_bearing, (height - extents.height) * 0.5 - extents.y_bearing);
+  cairo_show_text(cr, text);
+}
+
+static void draw_waveform_peaks(cairo_t *cr, const guint16 *peaks, gsize peak_count, double width, double height) {
+  const double mid_y = height * 0.5;
 
   cairo_set_source_rgb(cr, 0.35, 0.75, 0.50);
   cairo_set_line_width(cr, 2.0);
@@ -1709,86 +1766,90 @@ static gboolean on_waveform_base_draw(GtkWidget *widget, cairo_t *cr, gpointer u
   }
 
   cairo_stroke(cr);
+}
 
-  {
-    gboolean loop_enabled = FALSE;
-    gboolean loop_region_set = FALSE;
-    gdouble loop_start_frames = 0.0;
-    gdouble loop_end_frames = 0.0;
-    gdouble total_frames = 0.0;
-    gboolean use_full_width = FALSE;
-    gboolean active = FALSE;
-    gdouble start_ratio = 0.0;
-    gdouble end_ratio = 1.0;
+static void draw_loop_region(cairo_t *cr, const LoopSnapshot *loop, double width, double height) {
+  const gboolean active = loop->enabled || loop->explicit_region_set;
+  const double alpha = active ? 0.22 : 0.08;
+  const double color = active ? 0.45 : 0.55;
+  double start_x;
+  double end_x;
 
-    g_mutex_lock(&r->mutex);
-    total_frames = (gdouble)r->captured_frames;
-    loop_enabled = r->loop_enabled;
-    loop_region_set = r->loop_region_set;
-    loop_start_frames = r->loop_start_frames;
-    loop_end_frames = r->loop_end_frames;
-    g_mutex_unlock(&r->mutex);
-
-    if (total_frames > 0.0) {
-      if (loop_region_set) {
-        start_ratio = loop_start_frames / total_frames;
-        end_ratio = loop_end_frames / total_frames;
-      } else {
-        use_full_width = TRUE;
-      }
-      active = loop_enabled || loop_region_set;
-
-      if (use_full_width) {
-        start_ratio = 0.0;
-        end_ratio = 1.0;
-      }
-
-      {
-        const double alpha = active ? 0.22 : 0.08;
-        const double color = active ? 0.45 : 0.55;
-        double start_x = start_ratio * width;
-        double end_x = end_ratio * width;
-
-        cairo_set_source_rgba(cr, color, color, color, alpha);
-        cairo_rectangle(cr, start_x, 0, MAX(end_x - start_x, 0.0), height);
-        cairo_fill(cr);
-
-        cairo_set_source_rgba(cr, color, color, color, active ? 0.55 : 0.20);
-        cairo_set_line_width(cr, 3.0);
-        cairo_move_to(cr, start_x + 0.5, 0);
-        cairo_line_to(cr, start_x + 0.5, height);
-        cairo_move_to(cr, end_x + 0.5, 0);
-        cairo_line_to(cr, end_x + 0.5, height);
-        cairo_stroke(cr);
-
-        cairo_set_source_rgba(cr, color, color, color, active ? 0.9 : 0.35);
-        cairo_move_to(cr, start_x - 7.0, 2.0);
-        cairo_line_to(cr, start_x + 7.0, 2.0);
-        cairo_line_to(cr, start_x, 13.0);
-        cairo_close_path(cr);
-        cairo_fill(cr);
-
-        cairo_move_to(cr, end_x - 7.0, 2.0);
-        cairo_line_to(cr, end_x + 7.0, 2.0);
-        cairo_line_to(cr, end_x, 13.0);
-        cairo_close_path(cr);
-        cairo_fill(cr);
-      }
-    }
+  if (!loop->effective_region_set || loop->total_frames <= 0.0) {
+    return;
   }
 
-  {
-    double playhead_x = get_playhead_ratio(r) * width;
-    cairo_set_source_rgba(cr, 1.0, 0.55, 0.0, 0.16);
-    cairo_rectangle(cr, 0, 0, playhead_x, height);
-    cairo_fill(cr);
+  start_x = (loop->start_frames / loop->total_frames) * width;
+  end_x = (loop->end_frames / loop->total_frames) * width;
 
-    cairo_set_source_rgb(cr, 1.0, 0.55, 0.0);
-    cairo_set_line_width(cr, 3.0);
-    cairo_move_to(cr, playhead_x + 0.5, 0);
-    cairo_line_to(cr, playhead_x + 0.5, height);
-    cairo_stroke(cr);
+  cairo_set_source_rgba(cr, color, color, color, alpha);
+  cairo_rectangle(cr, start_x, 0, MAX(end_x - start_x, 0.0), height);
+  cairo_fill(cr);
+
+  cairo_set_source_rgba(cr, color, color, color, active ? 0.55 : 0.20);
+  cairo_set_line_width(cr, 3.0);
+  cairo_move_to(cr, start_x + 0.5, 0);
+  cairo_line_to(cr, start_x + 0.5, height);
+  cairo_move_to(cr, end_x + 0.5, 0);
+  cairo_line_to(cr, end_x + 0.5, height);
+  cairo_stroke(cr);
+
+  cairo_set_source_rgba(cr, color, color, color, active ? 0.9 : 0.35);
+  cairo_move_to(cr, start_x - 7.0, 2.0);
+  cairo_line_to(cr, start_x + 7.0, 2.0);
+  cairo_line_to(cr, start_x, 13.0);
+  cairo_close_path(cr);
+  cairo_fill(cr);
+
+  cairo_move_to(cr, end_x - 7.0, 2.0);
+  cairo_line_to(cr, end_x + 7.0, 2.0);
+  cairo_line_to(cr, end_x, 13.0);
+  cairo_close_path(cr);
+  cairo_fill(cr);
+}
+
+static void draw_playhead(cairo_t *cr, double playhead_ratio, double width, double height) {
+  double playhead_x = playhead_ratio * width;
+
+  cairo_set_source_rgba(cr, 1.0, 0.55, 0.0, 0.16);
+  cairo_rectangle(cr, 0, 0, playhead_x, height);
+  cairo_fill(cr);
+
+  cairo_set_source_rgb(cr, 1.0, 0.55, 0.0);
+  cairo_set_line_width(cr, 3.0);
+  cairo_move_to(cr, playhead_x + 0.5, 0);
+  cairo_line_to(cr, playhead_x + 0.5, height);
+  cairo_stroke(cr);
+}
+
+static gboolean on_waveform_base_draw(GtkWidget *widget, cairo_t *cr, gpointer user_data) {
+  Recorder *r = user_data;
+  GtkAllocation allocation;
+  LoopSnapshot loop;
+  guint16 *peaks = NULL;
+  gsize peak_count = 0;
+  double width;
+  double height;
+
+  gtk_widget_get_allocation(widget, &allocation);
+  width = allocation.width;
+  height = allocation.height;
+  loop = get_loop_snapshot(r);
+  peaks = copy_wave_peaks(r, &peak_count);
+
+  draw_waveform_background(cr, width, height);
+
+  if (peak_count == 0 || width <= 1.0) {
+    draw_waveform_empty(cr, width, height);
+    g_free(peaks);
+    return FALSE;
   }
+
+  draw_waveform_peaks(cr, peaks, peak_count, width, height);
+  g_free(peaks);
+
+  draw_loop_region(cr, &loop, width, height);
+  draw_playhead(cr, get_playhead_ratio(r), width, height);
 
   return FALSE;
 }
@@ -1801,7 +1862,6 @@ static gboolean on_waveform_button_press(GtkWidget *widget, GdkEventButton *even
   gdouble loop_start = 0.0;
   gdouble loop_end = 0.0;
   gboolean shift = FALSE;
-  gboolean region_set = FALSE;
   gboolean effective_region_set = FALSE;
   gboolean near_start = FALSE;
   gboolean near_end = FALSE;
@@ -1819,18 +1879,8 @@ static gboolean on_waveform_button_press(GtkWidget *widget, GdkEventButton *even
   g_mutex_lock(&r->mutex);
   total_frames = (gdouble)r->captured_frames;
   shift = (event->state & GDK_SHIFT_MASK) != 0;
-  region_set = r->loop_region_set;
-  if (region_set) {
-    loop_start = r->loop_start_frames;
-    loop_end = r->loop_end_frames;
-  }
+  effective_region_set = get_effective_loop_region_locked(r, total_frames, &loop_start, &loop_end);
   g_mutex_unlock(&r->mutex);
-
-  if (!region_set && total_frames > 0.0) {
-    loop_start = 0.0;
-    loop_end = total_frames;
-  }
-  effective_region_set = region_set || total_frames > 0.0;
 
   target_frames = (event->x / (double)allocation.width) * total_frames;
   handle_window = MAX(loop_min_width_frames(r) * 0.25, total_frames * 10.0 / (double)allocation.width);
@@ -1896,8 +1946,7 @@ static gboolean on_waveform_button_release(GtkWidget *widget, GdkEventButton *ev
   drag_anchor = r->loop_drag_anchor_frames;
   drag_offset = r->loop_drag_offset_frames;
   total_frames = (gdouble)r->captured_frames;
-  loop_start = r->loop_region_set ? r->loop_start_frames : 0.0;
-  loop_end = r->loop_region_set ? r->loop_end_frames : total_frames;
+  get_effective_loop_region_locked(r, total_frames, &loop_start, &loop_end);
   g_mutex_unlock(&r->mutex);
 
   if (drag_mode != LOOP_DRAG_NONE) {
@@ -1956,8 +2005,7 @@ static gboolean on_waveform_motion(GtkWidget *widget, GdkEventMotion *event, gpo
   drag_anchor = r->loop_drag_anchor_frames;
   drag_offset = r->loop_drag_offset_frames;
   total_frames = (gdouble)r->captured_frames;
-  loop_start = r->loop_region_set ? r->loop_start_frames : 0.0;
-  loop_end = r->loop_region_set ? r->loop_end_frames : total_frames;
+  get_effective_loop_region_locked(r, total_frames, &loop_start, &loop_end);
   g_mutex_unlock(&r->mutex);
 
   if (drag_mode != LOOP_DRAG_NONE) {
