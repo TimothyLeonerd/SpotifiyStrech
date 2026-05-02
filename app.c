@@ -21,6 +21,14 @@ typedef enum {
   MODE_PAUSED,
 } AppMode;
 
+typedef enum {
+  LOOP_DRAG_NONE = 0,
+  LOOP_DRAG_CREATE,
+  LOOP_DRAG_START,
+  LOOP_DRAG_END,
+  LOOP_DRAG_MOVE,
+} LoopDragMode;
+
 typedef struct {
   GtkWidget *status_label;
   GtkWidget *speed_value_label;
@@ -28,6 +36,7 @@ typedef struct {
   GtkWidget *waveform_base;
   GtkWidget *record_button;
   GtkWidget *play_pause_button;
+  GtkWidget *loop_button;
   GtkWidget *stop_button;
 
   GMutex mutex;
@@ -41,6 +50,13 @@ typedef struct {
   gdouble playback_anchor_frames;
   gint64 playback_anchor_us;
   gdouble display_playhead_frames;
+  gboolean loop_enabled;
+  gboolean loop_region_set;
+  gdouble loop_start_frames;
+  gdouble loop_end_frames;
+  LoopDragMode loop_drag_mode;
+  gdouble loop_drag_anchor_frames;
+  gdouble loop_drag_offset_frames;
   gboolean scrubbing;
   gboolean resume_after_scrub;
 
@@ -84,6 +100,7 @@ static void clear_error(Recorder *r) {
 static void update_button_sensitivity(Recorder *r) {
   gboolean record_enabled = FALSE;
   gboolean play_pause_enabled = FALSE;
+  gboolean loop_enabled = FALSE;
   gboolean stop_enabled = FALSE;
   const char *play_pause_label = "Play";
 
@@ -92,6 +109,7 @@ static void update_button_sensitivity(Recorder *r) {
     case MODE_IDLE:
       record_enabled = TRUE;
       play_pause_enabled = TRUE;
+      loop_enabled = TRUE;
       play_pause_label = "Play";
       break;
     case MODE_RECORDING:
@@ -104,11 +122,13 @@ static void update_button_sensitivity(Recorder *r) {
       break;
     case MODE_PLAYING:
       play_pause_enabled = TRUE;
+      loop_enabled = TRUE;
       stop_enabled = TRUE;
       play_pause_label = "Pause";
       break;
     case MODE_PAUSED:
       play_pause_enabled = TRUE;
+      loop_enabled = TRUE;
       stop_enabled = TRUE;
       play_pause_label = "Play";
       break;
@@ -117,6 +137,7 @@ static void update_button_sensitivity(Recorder *r) {
 
   gtk_widget_set_sensitive(r->record_button, record_enabled);
   gtk_widget_set_sensitive(r->play_pause_button, play_pause_enabled);
+  gtk_widget_set_sensitive(r->loop_button, loop_enabled);
   gtk_widget_set_sensitive(r->stop_button, stop_enabled);
   gtk_button_set_label(GTK_BUTTON(r->play_pause_button), play_pause_label);
 }
@@ -218,6 +239,8 @@ static void refresh_ui(Recorder *r) {
   AppMode mode;
   guint64 frames;
   guint rate;
+  gboolean loop_enabled = FALSE;
+  gboolean loop_region_set = FALSE;
   char error[256];
   double seconds;
 
@@ -225,17 +248,19 @@ static void refresh_ui(Recorder *r) {
   mode = r->mode;
   frames = r->captured_frames;
   rate = r->sample_rate ? r->sample_rate : 1;
+  loop_enabled = r->loop_enabled;
+  loop_region_set = r->loop_region_set;
   g_strlcpy(error, r->last_error, sizeof error);
   g_mutex_unlock(&r->mutex);
 
   seconds = (double)frames / (double)rate;
   if (error[0] != '\0') {
     char text[512];
-    g_snprintf(text, sizeof text, "%s | %.1fs captured | %s", mode_to_text(mode), seconds, error);
+    g_snprintf(text, sizeof text, "%s | %.1fs captured | %s | Loop %s%s", mode_to_text(mode), seconds, error, loop_enabled ? "on" : "off", loop_region_set ? " (set)" : "");
     gtk_label_set_text(GTK_LABEL(r->status_label), text);
   } else {
     char text[256];
-    g_snprintf(text, sizeof text, "%s | %.1fs captured", mode_to_text(mode), seconds);
+    g_snprintf(text, sizeof text, "%s | %.1fs captured | Loop %s%s", mode_to_text(mode), seconds, loop_enabled ? "on" : "off", loop_region_set ? " (set)" : "");
     gtk_label_set_text(GTK_LABEL(r->status_label), text);
   }
 
@@ -433,6 +458,115 @@ static double get_playhead_ratio(Recorder *r) {
   return cursor_frames / total_frames;
 }
 
+static void set_loop_region(Recorder *r, gdouble start_frames, gdouble end_frames) {
+  gdouble total_frames = 0.0;
+
+  if (start_frames > end_frames) {
+    gdouble tmp = start_frames;
+    start_frames = end_frames;
+    end_frames = tmp;
+  }
+
+  g_mutex_lock(&r->mutex);
+  total_frames = (gdouble)r->captured_frames;
+  if (start_frames < 0.0) {
+    start_frames = 0.0;
+  }
+  if (end_frames < 0.0) {
+    end_frames = 0.0;
+  }
+  if (start_frames > total_frames) {
+    start_frames = total_frames;
+  }
+  if (end_frames > total_frames) {
+    end_frames = total_frames;
+  }
+  r->loop_start_frames = start_frames;
+  r->loop_end_frames = end_frames;
+  r->loop_region_set = TRUE;
+  g_mutex_unlock(&r->mutex);
+}
+
+static gdouble loop_min_width_frames(Recorder *r) {
+  gdouble rate = 44100.0;
+
+  g_mutex_lock(&r->mutex);
+  rate = r->sample_rate ? (gdouble)r->sample_rate : 44100.0;
+  g_mutex_unlock(&r->mutex);
+
+  return MAX(0.25 * rate, 1.0);
+}
+
+static gdouble clamp_loop_frame(Recorder *r, gdouble frame) {
+  gdouble total_frames = 0.0;
+
+  g_mutex_lock(&r->mutex);
+  total_frames = (gdouble)r->captured_frames;
+  g_mutex_unlock(&r->mutex);
+
+  if (frame < 0.0) {
+    frame = 0.0;
+  }
+  if (frame > total_frames) {
+    frame = total_frames;
+  }
+  return frame;
+}
+
+static void finalize_loop_region(Recorder *r, gdouble start_frames, gdouble end_frames) {
+  gdouble min_width = loop_min_width_frames(r);
+  gdouble total_frames = 0.0;
+
+  if (start_frames > end_frames) {
+    gdouble tmp = start_frames;
+    start_frames = end_frames;
+    end_frames = tmp;
+  }
+
+  start_frames = clamp_loop_frame(r, start_frames);
+  end_frames = clamp_loop_frame(r, end_frames);
+
+  g_mutex_lock(&r->mutex);
+  total_frames = (gdouble)r->captured_frames;
+  g_mutex_unlock(&r->mutex);
+
+  if (end_frames - start_frames < min_width) {
+    gdouble center = (start_frames + end_frames) * 0.5;
+    start_frames = center - (min_width * 0.5);
+    end_frames = center + (min_width * 0.5);
+    if (start_frames < 0.0) {
+      end_frames -= start_frames;
+      start_frames = 0.0;
+    }
+    if (end_frames > total_frames) {
+      gdouble delta = end_frames - total_frames;
+      end_frames = total_frames;
+      start_frames -= delta;
+      if (start_frames < 0.0) {
+        start_frames = 0.0;
+      }
+    }
+  }
+
+  set_loop_region(r, start_frames, end_frames);
+}
+
+static void set_loop_drag(Recorder *r, LoopDragMode mode, gdouble anchor_frames, gdouble offset_frames) {
+  g_mutex_lock(&r->mutex);
+  r->loop_drag_mode = mode;
+  r->loop_drag_anchor_frames = anchor_frames;
+  r->loop_drag_offset_frames = offset_frames;
+  g_mutex_unlock(&r->mutex);
+}
+
+static void clear_loop_drag(Recorder *r) {
+  g_mutex_lock(&r->mutex);
+  r->loop_drag_mode = LOOP_DRAG_NONE;
+  r->loop_drag_anchor_frames = 0.0;
+  r->loop_drag_offset_frames = 0.0;
+  g_mutex_unlock(&r->mutex);
+}
+
 static gboolean playhead_tick_cb(GtkWidget *widget, GdkFrameClock *frame_clock, gpointer user_data) {
   (void)widget;
   (void)frame_clock;
@@ -527,11 +661,10 @@ static GByteArray *render_stretched_pcm(Recorder *rec,
                                         guint sample_rate,
                                         guint channels,
                                         guint64 start_frame,
+                                        guint64 end_frame,
                                         double speed,
                                         gboolean *cancelled) {
-  const guint frame_size = channels * sizeof(gint16);
-  const guint64 total_frames = snapshot->len / frame_size;
-  const guint64 input_frames = (start_frame < total_frames) ? (total_frames - start_frame) : 0;
+  const guint64 input_frames = (start_frame < end_frame) ? (end_frame - start_frame) : 0;
   const guint chunk_frames = 1024;
   const RubberBandOptions options = RubberBandOptionProcessOffline |
                                     RubberBandOptionEngineFiner |
@@ -920,11 +1053,10 @@ static gpointer playback_thread_main(gpointer user_data) {
   guint channels = 2;
   gdouble speed = 1.0;
   gdouble cursor_frames = 0.0;
-  guint64 start_frame = 0;
-  guint64 input_frames = 0;
-  guint64 rendered_frames = 0;
-  guint64 output_frames_played = 0;
-  gdouble input_progress_ratio = 1.0;
+  gdouble source_cursor_frame = 0.0;
+  gdouble final_cursor_frames = 0.0;
+  gboolean loop_enabled = FALSE;
+  gboolean loop_region_set = FALSE;
   pa_threaded_mainloop *ml = NULL;
   pa_context *context = NULL;
   pa_stream *stream = NULL;
@@ -933,6 +1065,7 @@ static gpointer playback_thread_main(gpointer user_data) {
   gboolean reached_end = FALSE;
   gboolean flush_on_exit = FALSE;
   gboolean cancelled = FALSE;
+  guint64 total_frames = 0;
   PulseQuery query = {0};
 
   g_printerr("[playback] thread started\n");
@@ -945,6 +1078,8 @@ static gpointer playback_thread_main(gpointer user_data) {
   channels = rec->channels;
   speed = rec->speed;
   cursor_frames = rec->playback_cursor_frames;
+  loop_enabled = rec->loop_enabled;
+  loop_region_set = rec->loop_region_set;
   g_mutex_unlock(&rec->mutex);
 
   if (snapshot->len == 0) {
@@ -953,32 +1088,19 @@ static gpointer playback_thread_main(gpointer user_data) {
   }
 
   {
-    const guint64 total_frames = snapshot->len / (channels * sizeof(gint16));
+    total_frames = snapshot->len / (channels * sizeof(gint16));
     if (cursor_frames < 0.0) {
       cursor_frames = 0.0;
     }
     if (cursor_frames > (gdouble)total_frames) {
       cursor_frames = (gdouble)total_frames;
     }
-    start_frame = (guint64)cursor_frames;
-    input_frames = total_frames - start_frame;
-  }
+    source_cursor_frame = cursor_frames;
+    final_cursor_frames = source_cursor_frame;
 
-  rendered = render_stretched_pcm(rec, snapshot, sample_rate, channels, start_frame, speed, &cancelled);
-  if (cancelled) {
-    goto cleanup;
+    g_printerr("[playback] source setup start=%.1f end=%" G_GUINT64_FORMAT " loop=%d region=%d\n",
+               source_cursor_frame, total_frames, loop_enabled ? 1 : 0, loop_region_set ? 1 : 0);
   }
-  if (!rendered) {
-    goto cleanup;
-  }
-
-  rendered_frames = rendered->len / (channels * sizeof(gint16));
-  if (rendered_frames == 0) {
-    set_error(rec, "Rubber Band produced no playback audio");
-    goto cleanup;
-  }
-
-  input_progress_ratio = (gdouble)input_frames / (gdouble)rendered_frames;
 
   ss.format = PA_SAMPLE_S16LE;
   ss.rate = sample_rate;
@@ -1072,19 +1194,123 @@ static gpointer playback_thread_main(gpointer user_data) {
 
   {
     const guint frame_size = channels * sizeof(gint16);
-    const guint8 *rendered_data = rendered->data;
+    const guint8 *rendered_data = NULL;
+    guint64 segment_start_frame = 0;
+    guint64 segment_end_frame = 0;
+    guint64 segment_rendered_frames = 0;
+    guint64 output_frames_played = 0;
+    gdouble segment_progress_ratio = 1.0;
+    gboolean loop_armed = FALSE;
 
     g_mutex_lock(&rec->mutex);
-    rec->playback_cursor_frames = cursor_frames;
-    rec->playback_anchor_frames = cursor_frames;
+    rec->playback_cursor_frames = source_cursor_frame;
+    rec->playback_anchor_frames = source_cursor_frame;
     rec->playback_anchor_us = g_get_monotonic_time();
-    rec->display_playhead_frames = cursor_frames;
+    rec->display_playhead_frames = source_cursor_frame;
     rec->mode = MODE_PLAYING;
     g_mutex_unlock(&rec->mutex);
     g_idle_add(refresh_ui_idle_cb, rec);
 
-    while (output_frames_played < rendered_frames) {
+    while (1) {
       gboolean stop_requested;
+      gboolean live_loop_enabled = FALSE;
+      gboolean live_loop_region_set = FALSE;
+      guint64 live_loop_start_frame = 0;
+      guint64 live_loop_end_frame = 0;
+      gboolean live_loop_valid = FALSE;
+      guint64 desired_start_frame = 0;
+      guint64 desired_end_frame = total_frames;
+
+      g_mutex_lock(&rec->mutex);
+      live_loop_enabled = rec->loop_enabled;
+      live_loop_region_set = rec->loop_region_set || total_frames > 0;
+      if (live_loop_region_set) {
+        gdouble live_loop_start = rec->loop_region_set ? rec->loop_start_frames : 0.0;
+        gdouble live_loop_end = rec->loop_region_set ? rec->loop_end_frames : (gdouble)total_frames;
+        if (live_loop_start < 0.0) live_loop_start = 0.0;
+        if (live_loop_end < 0.0) live_loop_end = 0.0;
+        if (live_loop_start > (gdouble)total_frames) live_loop_start = (gdouble)total_frames;
+        if (live_loop_end > (gdouble)total_frames) live_loop_end = (gdouble)total_frames;
+        if (live_loop_start > live_loop_end) {
+          gdouble tmp = live_loop_start;
+          live_loop_start = live_loop_end;
+          live_loop_end = tmp;
+        }
+        live_loop_start_frame = (guint64)live_loop_start;
+        live_loop_end_frame = (guint64)live_loop_end;
+      }
+      g_mutex_unlock(&rec->mutex);
+
+      live_loop_valid = live_loop_enabled && live_loop_region_set && live_loop_end_frame > live_loop_start_frame;
+
+      if (live_loop_valid && loop_armed && source_cursor_frame >= (gdouble)live_loop_end_frame) {
+        source_cursor_frame = (gdouble)live_loop_start_frame;
+        final_cursor_frames = source_cursor_frame;
+        rendered_data = NULL;
+        if (rendered) {
+          g_byte_array_unref(rendered);
+          rendered = NULL;
+        }
+        g_mutex_lock(&rec->mutex);
+        rec->playback_cursor_frames = source_cursor_frame;
+        rec->playback_anchor_frames = source_cursor_frame;
+        rec->playback_anchor_us = g_get_monotonic_time();
+        rec->display_playhead_frames = source_cursor_frame;
+        g_mutex_unlock(&rec->mutex);
+        g_idle_add(refresh_ui_idle_cb, rec);
+        continue;
+      }
+
+      if (!live_loop_valid) {
+        loop_armed = FALSE;
+      }
+
+      if (source_cursor_frame >= (gdouble)total_frames) {
+        reached_end = TRUE;
+        break;
+      }
+
+      desired_start_frame = (guint64)source_cursor_frame;
+      desired_end_frame = total_frames;
+      if (live_loop_valid && source_cursor_frame < (gdouble)live_loop_end_frame) {
+        loop_armed = TRUE;
+        desired_end_frame = live_loop_end_frame;
+      }
+
+      if (desired_start_frame >= desired_end_frame) {
+        source_cursor_frame = (gdouble)desired_end_frame;
+        continue;
+      }
+
+      if (!rendered ||
+          output_frames_played >= segment_rendered_frames ||
+          source_cursor_frame < (gdouble)segment_start_frame ||
+          source_cursor_frame > (gdouble)segment_end_frame) {
+        if (rendered) {
+          g_byte_array_unref(rendered);
+          rendered = NULL;
+        }
+
+        rendered = render_stretched_pcm(rec, snapshot, sample_rate, channels, desired_start_frame, desired_end_frame, speed, &cancelled);
+        if (cancelled) {
+          goto fail_locked;
+        }
+        if (!rendered) {
+          goto fail_locked;
+        }
+
+        segment_rendered_frames = rendered->len / frame_size;
+        if (segment_rendered_frames == 0) {
+          set_error(rec, "Rubber Band produced no playback audio");
+          goto fail_locked;
+        }
+
+        segment_start_frame = desired_start_frame;
+        segment_end_frame = desired_end_frame;
+        segment_progress_ratio = (gdouble)(segment_end_frame - segment_start_frame) / (gdouble)segment_rendered_frames;
+        output_frames_played = 0;
+        rendered_data = rendered->data;
+      }
 
       stop_requested = playback_should_stop(rec);
       while (!stop_requested && pa_stream_writable_size(stream) == 0) {
@@ -1103,8 +1329,8 @@ static gpointer playback_thread_main(gpointer user_data) {
         continue;
       }
 
-      if (output_frames_played + out_frames > rendered_frames) {
-        out_frames = (guint)(rendered_frames - output_frames_played);
+      if (output_frames_played + out_frames > segment_rendered_frames) {
+        out_frames = (guint)(segment_rendered_frames - output_frames_played);
       }
 
       if (out_frames == 0) {
@@ -1122,19 +1348,17 @@ static gpointer playback_thread_main(gpointer user_data) {
       }
 
       output_frames_played += out_frames;
+      source_cursor_frame = (gdouble)segment_start_frame + ((gdouble)output_frames_played * segment_progress_ratio);
+      if (source_cursor_frame > (gdouble)segment_end_frame) {
+        source_cursor_frame = (gdouble)segment_end_frame;
+      }
 
       g_mutex_lock(&rec->mutex);
-      rec->playback_cursor_frames = cursor_frames + ((gdouble)output_frames_played * input_progress_ratio);
-      if (rec->playback_cursor_frames > (gdouble)(start_frame + input_frames)) {
-        rec->playback_cursor_frames = (gdouble)(start_frame + input_frames);
-      }
+      rec->playback_cursor_frames = source_cursor_frame;
+      final_cursor_frames = rec->playback_cursor_frames;
       rec->playback_anchor_frames = rec->playback_cursor_frames;
       rec->playback_anchor_us = g_get_monotonic_time();
       g_mutex_unlock(&rec->mutex);
-    }
-
-    if (output_frames_played >= rendered_frames) {
-      reached_end = TRUE;
     }
   }
 
@@ -1190,7 +1414,7 @@ cleanup:
 
   g_mutex_lock(&rec->mutex);
   rec->playback_ml = NULL;
-  rec->playback_cursor_frames = reached_end ? 0.0 : (cursor_frames + ((gdouble)output_frames_played * input_progress_ratio));
+  rec->playback_cursor_frames = reached_end ? 0.0 : final_cursor_frames;
   rec->playback_anchor_frames = rec->playback_cursor_frames;
   rec->playback_anchor_us = g_get_monotonic_time();
   if (!flush_on_exit) {
@@ -1422,6 +1646,17 @@ static void on_speed_changed(GtkRange *range, gpointer user_data) {
   }
 }
 
+static void on_loop_toggled(GtkToggleButton *button, gpointer user_data) {
+  Recorder *r = user_data;
+  gboolean active = gtk_toggle_button_get_active(button);
+
+  g_mutex_lock(&r->mutex);
+  r->loop_enabled = active;
+  g_mutex_unlock(&r->mutex);
+
+  refresh_ui(r);
+}
+
 static gboolean on_waveform_base_draw(GtkWidget *widget, cairo_t *cr, gpointer user_data) {
   Recorder *r = user_data;
   GtkAllocation allocation;
@@ -1476,6 +1711,73 @@ static gboolean on_waveform_base_draw(GtkWidget *widget, cairo_t *cr, gpointer u
   cairo_stroke(cr);
 
   {
+    gboolean loop_enabled = FALSE;
+    gboolean loop_region_set = FALSE;
+    gdouble loop_start_frames = 0.0;
+    gdouble loop_end_frames = 0.0;
+    gdouble total_frames = 0.0;
+    gboolean use_full_width = FALSE;
+    gboolean active = FALSE;
+    gdouble start_ratio = 0.0;
+    gdouble end_ratio = 1.0;
+
+    g_mutex_lock(&r->mutex);
+    total_frames = (gdouble)r->captured_frames;
+    loop_enabled = r->loop_enabled;
+    loop_region_set = r->loop_region_set;
+    loop_start_frames = r->loop_start_frames;
+    loop_end_frames = r->loop_end_frames;
+    g_mutex_unlock(&r->mutex);
+
+    if (total_frames > 0.0) {
+      if (loop_region_set) {
+        start_ratio = loop_start_frames / total_frames;
+        end_ratio = loop_end_frames / total_frames;
+      } else {
+        use_full_width = TRUE;
+      }
+      active = loop_enabled || loop_region_set;
+
+      if (use_full_width) {
+        start_ratio = 0.0;
+        end_ratio = 1.0;
+      }
+
+      {
+        const double alpha = active ? 0.22 : 0.08;
+        const double color = active ? 0.45 : 0.55;
+        double start_x = start_ratio * width;
+        double end_x = end_ratio * width;
+
+        cairo_set_source_rgba(cr, color, color, color, alpha);
+        cairo_rectangle(cr, start_x, 0, MAX(end_x - start_x, 0.0), height);
+        cairo_fill(cr);
+
+        cairo_set_source_rgba(cr, color, color, color, active ? 0.55 : 0.20);
+        cairo_set_line_width(cr, 3.0);
+        cairo_move_to(cr, start_x + 0.5, 0);
+        cairo_line_to(cr, start_x + 0.5, height);
+        cairo_move_to(cr, end_x + 0.5, 0);
+        cairo_line_to(cr, end_x + 0.5, height);
+        cairo_stroke(cr);
+
+        cairo_set_source_rgba(cr, color, color, color, active ? 0.9 : 0.35);
+        cairo_move_to(cr, start_x - 7.0, 2.0);
+        cairo_line_to(cr, start_x + 7.0, 2.0);
+        cairo_line_to(cr, start_x, 13.0);
+        cairo_close_path(cr);
+        cairo_fill(cr);
+
+        cairo_move_to(cr, end_x - 7.0, 2.0);
+        cairo_line_to(cr, end_x + 7.0, 2.0);
+        cairo_line_to(cr, end_x, 13.0);
+        cairo_close_path(cr);
+        cairo_fill(cr);
+      }
+    }
+  }
+
+  {
     double playhead_x = get_playhead_ratio(r) * width;
     cairo_set_source_rgba(cr, 1.0, 0.55, 0.0, 0.16);
     cairo_rectangle(cr, 0, 0, playhead_x, height);
@@ -1494,7 +1796,16 @@ static gboolean on_waveform_base_draw(GtkWidget *widget, cairo_t *cr, gpointer u
 static gboolean on_waveform_button_press(GtkWidget *widget, GdkEventButton *event, gpointer user_data) {
   Recorder *r = user_data;
   GtkAllocation allocation;
-  double fraction = 0.0;
+  gdouble total_frames = 0.0;
+  gdouble target_frames = 0.0;
+  gdouble loop_start = 0.0;
+  gdouble loop_end = 0.0;
+  gboolean shift = FALSE;
+  gboolean region_set = FALSE;
+  gboolean effective_region_set = FALSE;
+  gboolean near_start = FALSE;
+  gboolean near_end = FALSE;
+  gdouble handle_window = 0.0;
 
   if (event->button != 1) {
     return FALSE;
@@ -1505,25 +1816,122 @@ static gboolean on_waveform_button_press(GtkWidget *widget, GdkEventButton *even
     return FALSE;
   }
 
+  g_mutex_lock(&r->mutex);
+  total_frames = (gdouble)r->captured_frames;
+  shift = (event->state & GDK_SHIFT_MASK) != 0;
+  region_set = r->loop_region_set;
+  if (region_set) {
+    loop_start = r->loop_start_frames;
+    loop_end = r->loop_end_frames;
+  }
+  g_mutex_unlock(&r->mutex);
+
+  if (!region_set && total_frames > 0.0) {
+    loop_start = 0.0;
+    loop_end = total_frames;
+  }
+  effective_region_set = region_set || total_frames > 0.0;
+
+  target_frames = (event->x / (double)allocation.width) * total_frames;
+  handle_window = MAX(loop_min_width_frames(r) * 0.25, total_frames * 10.0 / (double)allocation.width);
+
+  if (shift && total_frames > 0.0) {
+    set_loop_drag(r, LOOP_DRAG_CREATE, target_frames, 0.0);
+    if (!grab_scrub_pointer(widget, event)) {
+      g_printerr("[loop] pointer grab failed\n");
+    }
+    gtk_widget_queue_draw(r->waveform_base);
+    return TRUE;
+  }
+
+  if (effective_region_set) {
+    near_start = fabs(target_frames - loop_start) <= handle_window;
+    near_end = fabs(target_frames - loop_end) <= handle_window;
+
+    if (near_start) {
+      set_loop_drag(r, LOOP_DRAG_START, 0.0, 0.0);
+      if (!grab_scrub_pointer(widget, event)) {
+        g_printerr("[loop] pointer grab failed\n");
+      }
+      return TRUE;
+    }
+
+    if (near_end) {
+      set_loop_drag(r, LOOP_DRAG_END, 0.0, 0.0);
+      if (!grab_scrub_pointer(widget, event)) {
+        g_printerr("[loop] pointer grab failed\n");
+      }
+      return TRUE;
+    }
+  }
+
   begin_scrub(r);
   if (!grab_scrub_pointer(widget, event)) {
     g_printerr("[scrub] pointer grab failed\n");
   }
-  fraction = event->x / (double)allocation.width;
-  g_printerr("[click] widget=%s x=%.1f width=%d fraction=%.3f\n", G_OBJECT_TYPE_NAME(widget), event->x, allocation.width, fraction);
-  seek_to_fraction(r, fraction);
+  if (total_frames > 0.0) {
+    seek_to_fraction(r, target_frames / total_frames);
+  }
   return TRUE;
 }
 
 static gboolean on_waveform_button_release(GtkWidget *widget, GdkEventButton *event, gpointer user_data) {
-  (void)widget;
   Recorder *r = user_data;
+  LoopDragMode drag_mode = LOOP_DRAG_NONE;
+  gdouble drag_anchor = 0.0;
+  gdouble drag_offset = 0.0;
+  gdouble loop_start = 0.0;
+  gdouble loop_end = 0.0;
+  gdouble total_frames = 0.0;
+  gdouble current_frames = 0.0;
 
   if (event->button != 1) {
     return FALSE;
   }
 
   release_scrub_pointer(widget, event);
+
+  g_mutex_lock(&r->mutex);
+  drag_mode = r->loop_drag_mode;
+  drag_anchor = r->loop_drag_anchor_frames;
+  drag_offset = r->loop_drag_offset_frames;
+  total_frames = (gdouble)r->captured_frames;
+  loop_start = r->loop_region_set ? r->loop_start_frames : 0.0;
+  loop_end = r->loop_region_set ? r->loop_end_frames : total_frames;
+  g_mutex_unlock(&r->mutex);
+
+  if (drag_mode != LOOP_DRAG_NONE) {
+    if (gtk_widget_get_allocated_width(widget) > 0) {
+      current_frames = (event->x / (double)gtk_widget_get_allocated_width(widget)) * total_frames;
+    }
+
+    switch (drag_mode) {
+      case LOOP_DRAG_CREATE:
+        finalize_loop_region(r, drag_anchor, current_frames);
+        break;
+      case LOOP_DRAG_START:
+        finalize_loop_region(r, current_frames, loop_end);
+        break;
+      case LOOP_DRAG_END:
+        finalize_loop_region(r, loop_start, current_frames);
+        break;
+      case LOOP_DRAG_MOVE: {
+        gdouble width = loop_end - loop_start;
+        gdouble new_start = current_frames - drag_offset;
+        finalize_loop_region(r, new_start, new_start + width);
+        break;
+      }
+      case LOOP_DRAG_NONE:
+        break;
+    }
+
+    clear_loop_drag(r);
+    refresh_ui(r);
+    gtk_widget_queue_draw(r->waveform_base);
+
+    return TRUE;
+  }
+
   end_scrub(r);
   return TRUE;
 }
@@ -1534,10 +1942,57 @@ static gboolean on_waveform_motion(GtkWidget *widget, GdkEventMotion *event, gpo
   double x = event->x;
   double fraction = 0.0;
   gboolean scrubbing = FALSE;
+  LoopDragMode drag_mode = LOOP_DRAG_NONE;
+  gdouble drag_anchor = 0.0;
+  gdouble drag_offset = 0.0;
+  gdouble loop_start = 0.0;
+  gdouble loop_end = 0.0;
+  gdouble total_frames = 0.0;
+  gdouble current_frames = 0.0;
 
   g_mutex_lock(&r->mutex);
   scrubbing = r->scrubbing;
+  drag_mode = r->loop_drag_mode;
+  drag_anchor = r->loop_drag_anchor_frames;
+  drag_offset = r->loop_drag_offset_frames;
+  total_frames = (gdouble)r->captured_frames;
+  loop_start = r->loop_region_set ? r->loop_start_frames : 0.0;
+  loop_end = r->loop_region_set ? r->loop_end_frames : total_frames;
   g_mutex_unlock(&r->mutex);
+
+  if (drag_mode != LOOP_DRAG_NONE) {
+    gtk_widget_get_allocation(widget, &allocation);
+    if (allocation.width <= 0) {
+      return FALSE;
+    }
+
+    fraction = x / (double)allocation.width;
+    current_frames = fraction * total_frames;
+
+    switch (drag_mode) {
+      case LOOP_DRAG_CREATE:
+        finalize_loop_region(r, drag_anchor, current_frames);
+        break;
+      case LOOP_DRAG_START:
+        finalize_loop_region(r, current_frames, loop_end);
+        break;
+      case LOOP_DRAG_END:
+        finalize_loop_region(r, loop_start, current_frames);
+        break;
+      case LOOP_DRAG_MOVE: {
+        gdouble width = loop_end - loop_start;
+        gdouble new_start = current_frames - drag_offset;
+        finalize_loop_region(r, new_start, new_start + width);
+        break;
+      }
+      case LOOP_DRAG_NONE:
+        break;
+    }
+
+    gtk_widget_queue_draw(r->waveform_base);
+    return TRUE;
+  }
+
   if (!scrubbing) {
     return FALSE;
   }
@@ -1584,6 +2039,7 @@ static void activate(GtkApplication *app, gpointer user_data) {
   GtkWidget *record_button = gtk_button_new_with_label("Record");
   GtkWidget *stop_button = gtk_button_new_with_label("Stop");
   GtkWidget *play_pause_button = gtk_button_new_with_label("Play");
+  GtkWidget *loop_button = gtk_toggle_button_new_with_label("Loop");
   GtkWidget *speed_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
   GtkWidget *speed_label = gtk_label_new("Playback speed");
   GtkWidget *speed_value = gtk_label_new("1.0x");
@@ -1598,6 +2054,7 @@ static void activate(GtkApplication *app, gpointer user_data) {
   r->time_label = time_label;
   r->record_button = record_button;
   r->play_pause_button = play_pause_button;
+  r->loop_button = loop_button;
   r->stop_button = stop_button;
   r->sample_rate = 44100;
   r->channels = 2;
@@ -1620,6 +2077,7 @@ static void activate(GtkApplication *app, gpointer user_data) {
   gtk_box_pack_start(GTK_BOX(controls), record_button, FALSE, FALSE, 0);
   gtk_box_pack_start(GTK_BOX(controls), stop_button, FALSE, FALSE, 0);
   gtk_box_pack_start(GTK_BOX(controls), play_pause_button, FALSE, FALSE, 0);
+  gtk_box_pack_start(GTK_BOX(controls), loop_button, FALSE, FALSE, 0);
 
   gtk_scale_set_draw_value(GTK_SCALE(speed_scale), FALSE);
   gtk_range_set_value(GTK_RANGE(speed_scale), 1.0);
@@ -1646,6 +2104,7 @@ static void activate(GtkApplication *app, gpointer user_data) {
   g_signal_connect(record_button, "clicked", G_CALLBACK(on_record_clicked), r);
   g_signal_connect(stop_button, "clicked", G_CALLBACK(on_stop_clicked), r);
   g_signal_connect(play_pause_button, "clicked", G_CALLBACK(on_play_pause_clicked), r);
+  g_signal_connect(loop_button, "toggled", G_CALLBACK(on_loop_toggled), r);
   g_signal_connect(speed_scale, "value-changed", G_CALLBACK(on_speed_changed), r);
   g_signal_connect(waveform_base, "draw", G_CALLBACK(on_waveform_base_draw), r);
   g_signal_connect(waveform_base, "button-press-event", G_CALLBACK(on_waveform_button_press), r);
