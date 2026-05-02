@@ -47,6 +47,10 @@ typedef struct {
   GtkWidget *play_pause_button;
   GtkWidget *loop_button;
   GtkWidget *stop_button;
+} AppWidgets;
+
+typedef struct {
+  AppWidgets widgets;
 
   GMutex mutex;
   GByteArray *pcm;
@@ -144,11 +148,11 @@ static void update_button_sensitivity(Recorder *r) {
   }
   g_mutex_unlock(&r->mutex);
 
-  gtk_widget_set_sensitive(r->record_button, record_enabled);
-  gtk_widget_set_sensitive(r->play_pause_button, play_pause_enabled);
-  gtk_widget_set_sensitive(r->loop_button, loop_enabled);
-  gtk_widget_set_sensitive(r->stop_button, stop_enabled);
-  gtk_button_set_label(GTK_BUTTON(r->play_pause_button), play_pause_label);
+  gtk_widget_set_sensitive(r->widgets.record_button, record_enabled);
+  gtk_widget_set_sensitive(r->widgets.play_pause_button, play_pause_enabled);
+  gtk_widget_set_sensitive(r->widgets.loop_button, loop_enabled);
+  gtk_widget_set_sensitive(r->widgets.stop_button, stop_enabled);
+  gtk_button_set_label(GTK_BUTTON(r->widgets.play_pause_button), play_pause_label);
 }
 
 static void set_mode(Recorder *r, AppMode mode) {
@@ -205,7 +209,7 @@ static void update_time_label(Recorder *r) {
   g_mutex_unlock(&r->mutex);
 
   time_text = g_strdup_printf("%.1f / %.1fs", cursor_frames / (double)rate, total_frames / (double)rate);
-  gtk_label_set_text(GTK_LABEL(r->time_label), time_text);
+  gtk_label_set_text(GTK_LABEL(r->widgets.time_label), time_text);
   g_free(time_text);
 }
 
@@ -266,11 +270,11 @@ static void refresh_ui(Recorder *r) {
   if (error[0] != '\0') {
     char text[512];
     g_snprintf(text, sizeof text, "%s | %.1fs captured | %s | Loop %s%s", mode_to_text(mode), seconds, error, loop_enabled ? "on" : "off", loop_region_set ? " (set)" : "");
-    gtk_label_set_text(GTK_LABEL(r->status_label), text);
+    gtk_label_set_text(GTK_LABEL(r->widgets.status_label), text);
   } else {
     char text[256];
     g_snprintf(text, sizeof text, "%s | %.1fs captured | Loop %s%s", mode_to_text(mode), seconds, loop_enabled ? "on" : "off", loop_region_set ? " (set)" : "");
-    gtk_label_set_text(GTK_LABEL(r->status_label), text);
+    gtk_label_set_text(GTK_LABEL(r->widgets.status_label), text);
   }
 
   {
@@ -278,11 +282,11 @@ static void refresh_ui(Recorder *r) {
   }
 
   update_button_sensitivity(r);
-  gtk_widget_queue_draw(r->waveform_base);
+  gtk_widget_queue_draw(r->widgets.waveform_base);
 
   {
-    gint width = gtk_widget_get_allocated_width(r->waveform_base);
-    gint height = gtk_widget_get_allocated_height(r->waveform_base);
+    gint width = gtk_widget_get_allocated_width(r->widgets.waveform_base);
+    gint height = gtk_widget_get_allocated_height(r->widgets.waveform_base);
     gint new_x = (gint)lrint(get_playhead_ratio(r) * (double)width);
     gint old_x = r->last_playhead_x;
     gint x1 = MIN(old_x, new_x) - 6;
@@ -292,7 +296,7 @@ static void refresh_ui(Recorder *r) {
       if (x1 < 0) x1 = 0;
       if (x2 > width) x2 = width;
       if (x2 > x1) {
-        gtk_widget_queue_draw_area(r->waveform_base, x1, 0, x2 - x1, height);
+        gtk_widget_queue_draw_area(r->widgets.waveform_base, x1, 0, x2 - x1, height);
       }
     }
 
@@ -423,7 +427,7 @@ static void update_scrub(Recorder *r, double fraction) {
 
   g_printerr("[scrub] fraction=%.3f target_frames=%.1f mode=%d\n", fraction, target_frames, mode);
   update_time_label(r);
-  gtk_widget_queue_draw(r->waveform_base);
+  gtk_widget_queue_draw(r->widgets.waveform_base);
 }
 
 static void end_scrub(Recorder *r) {
@@ -650,7 +654,7 @@ static gboolean playhead_tick_cb(GtkWidget *widget, GdkFrameClock *frame_clock, 
   }
 
   update_time_label(r);
-  gtk_widget_queue_draw(r->waveform_base);
+  gtk_widget_queue_draw(r->widgets.waveform_base);
   return G_SOURCE_CONTINUE;
 }
 
@@ -662,7 +666,7 @@ static gboolean refresh_ui_idle_cb(gpointer user_data) {
 static void update_speed_label(Recorder *r, double speed) {
   char text[32];
   g_snprintf(text, sizeof text, "%.1fx", speed);
-  gtk_label_set_text(GTK_LABEL(r->speed_value_label), text);
+  gtk_label_set_text(GTK_LABEL(r->widgets.speed_value_label), text);
 }
 
 static inline gint16 clamp_i16(gint32 value) {
@@ -1926,7 +1930,7 @@ static gboolean on_waveform_button_press(GtkWidget *widget, GdkEventButton *even
     if (!grab_scrub_pointer(widget, event)) {
       g_printerr("[loop] pointer grab failed\n");
     }
-    gtk_widget_queue_draw(r->waveform_base);
+    gtk_widget_queue_draw(r->widgets.waveform_base);
     return TRUE;
   }
 
@@ -2012,7 +2016,7 @@ static gboolean on_waveform_button_release(GtkWidget *widget, GdkEventButton *ev
 
     clear_loop_drag(r);
     refresh_ui(r);
-    gtk_widget_queue_draw(r->waveform_base);
+    gtk_widget_queue_draw(r->widgets.waveform_base);
 
     return TRUE;
   }
@@ -2073,7 +2077,7 @@ static gboolean on_waveform_motion(GtkWidget *widget, GdkEventMotion *event, gpo
         break;
     }
 
-    gtk_widget_queue_draw(r->waveform_base);
+    gtk_widget_queue_draw(r->widgets.waveform_base);
     return TRUE;
   }
 
@@ -2096,7 +2100,7 @@ static void on_window_destroy(GtkWidget *widget, gpointer user_data) {
   Recorder *r = user_data;
 
   if (r->tick_callback_id) {
-    gtk_widget_remove_tick_callback(r->waveform_base, r->tick_callback_id);
+    gtk_widget_remove_tick_callback(r->widgets.waveform_base, r->tick_callback_id);
   }
 
   stop_playback_thread(r, TRUE);
@@ -2132,14 +2136,14 @@ static void activate(GtkApplication *app, gpointer user_data) {
   GtkWidget *time_label = gtk_label_new("0.0 / 0.0s");
   GtkWidget *status = gtk_label_new("Stopped | 0.0s captured");
 
-  r->status_label = status;
-  r->speed_value_label = speed_value;
-  r->waveform_base = waveform_base;
-  r->time_label = time_label;
-  r->record_button = record_button;
-  r->play_pause_button = play_pause_button;
-  r->loop_button = loop_button;
-  r->stop_button = stop_button;
+  r->widgets.status_label = status;
+  r->widgets.speed_value_label = speed_value;
+  r->widgets.waveform_base = waveform_base;
+  r->widgets.time_label = time_label;
+  r->widgets.record_button = record_button;
+  r->widgets.play_pause_button = play_pause_button;
+  r->widgets.loop_button = loop_button;
+  r->widgets.stop_button = stop_button;
   r->sample_rate = 44100;
   r->channels = 2;
   r->pcm = g_byte_array_new();
