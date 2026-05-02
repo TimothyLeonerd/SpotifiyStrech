@@ -50,26 +50,34 @@ typedef struct {
 } AppWidgets;
 
 typedef struct {
-  AppWidgets widgets;
+  gboolean enabled;
+  gboolean region_set;
+  gdouble start_frames;
+  gdouble end_frames;
+  LoopDragMode drag_mode;
+  gdouble drag_anchor_frames;
+  gdouble drag_offset_frames;
+} LoopState;
 
-  GMutex mutex;
+typedef struct {
   GByteArray *pcm;
   GArray *wave_peaks;
   guint sample_rate;
   guint channels;
   guint64 captured_frames;
+} AudioBuffer;
+
+typedef struct {
+  AppWidgets widgets;
+
+  GMutex mutex;
+  AudioBuffer audio;
   gdouble speed;
   gdouble playback_cursor_frames;
   gdouble playback_anchor_frames;
   gint64 playback_anchor_us;
   gdouble display_playhead_frames;
-  gboolean loop_enabled;
-  gboolean loop_region_set;
-  gdouble loop_start_frames;
-  gdouble loop_end_frames;
-  LoopDragMode loop_drag_mode;
-  gdouble loop_drag_anchor_frames;
-  gdouble loop_drag_offset_frames;
+  LoopState loop;
   gboolean scrubbing;
   gboolean resume_after_scrub;
 
@@ -203,9 +211,9 @@ static void update_time_label(Recorder *r) {
   char *time_text = NULL;
 
   g_mutex_lock(&r->mutex);
-  rate = r->sample_rate ? r->sample_rate : 1;
+  rate = r->audio.sample_rate ? r->audio.sample_rate : 1;
   cursor_frames = r->display_playhead_frames;
-  total_frames = (gdouble)r->captured_frames;
+  total_frames = (gdouble)r->audio.captured_frames;
   g_mutex_unlock(&r->mutex);
 
   time_text = g_strdup_printf("%.1f / %.1fs", cursor_frames / (double)rate, total_frames / (double)rate);
@@ -228,7 +236,7 @@ static gdouble get_current_playback_frames(Recorder *r) {
   cursor_frames = r->playback_cursor_frames;
   anchor_frames = r->playback_anchor_frames;
   anchor_us = r->playback_anchor_us;
-  rate = r->sample_rate ? r->sample_rate : 1;
+  rate = r->audio.sample_rate ? r->audio.sample_rate : 1;
   speed = r->speed;
   g_mutex_unlock(&r->mutex);
 
@@ -259,10 +267,10 @@ static void refresh_ui(Recorder *r) {
 
   g_mutex_lock(&r->mutex);
   mode = r->mode;
-  frames = r->captured_frames;
-  rate = r->sample_rate ? r->sample_rate : 1;
-  loop_enabled = r->loop_enabled;
-  loop_region_set = r->loop_region_set;
+  frames = r->audio.captured_frames;
+  rate = r->audio.sample_rate ? r->audio.sample_rate : 1;
+  loop_enabled = r->loop.enabled;
+  loop_region_set = r->loop.region_set;
   g_strlcpy(error, r->last_error, sizeof error);
   g_mutex_unlock(&r->mutex);
 
@@ -327,7 +335,7 @@ static void seek_to_fraction(Recorder *r, double fraction) {
   g_mutex_lock(&r->mutex);
   mode = r->mode;
   scrubbing = r->scrubbing;
-  total_frames = (gdouble)r->captured_frames;
+  total_frames = (gdouble)r->audio.captured_frames;
   target_frames = total_frames * fraction;
   set_playback_cursor_locked(r, target_frames);
   g_mutex_unlock(&r->mutex);
@@ -420,7 +428,7 @@ static void update_scrub(Recorder *r, double fraction) {
 
   g_mutex_lock(&r->mutex);
   mode = r->mode;
-  total_frames = (gdouble)r->captured_frames;
+  total_frames = (gdouble)r->audio.captured_frames;
   target_frames = total_frames * fraction;
   set_playback_cursor_locked(r, target_frames);
   g_mutex_unlock(&r->mutex);
@@ -455,7 +463,7 @@ static double get_playhead_ratio(Recorder *r) {
 
   g_mutex_lock(&r->mutex);
   cursor_frames = r->display_playhead_frames;
-  total_frames = (double)r->captured_frames;
+  total_frames = (double)r->audio.captured_frames;
   g_mutex_unlock(&r->mutex);
 
   if (total_frames <= 0.0) {
@@ -482,7 +490,7 @@ static void set_loop_region(Recorder *r, gdouble start_frames, gdouble end_frame
   }
 
   g_mutex_lock(&r->mutex);
-  total_frames = (gdouble)r->captured_frames;
+  total_frames = (gdouble)r->audio.captured_frames;
   if (start_frames < 0.0) {
     start_frames = 0.0;
   }
@@ -495,9 +503,9 @@ static void set_loop_region(Recorder *r, gdouble start_frames, gdouble end_frame
   if (end_frames > total_frames) {
     end_frames = total_frames;
   }
-  r->loop_start_frames = start_frames;
-  r->loop_end_frames = end_frames;
-  r->loop_region_set = TRUE;
+  r->loop.start_frames = start_frames;
+  r->loop.end_frames = end_frames;
+  r->loop.region_set = TRUE;
   g_mutex_unlock(&r->mutex);
 }
 
@@ -505,7 +513,7 @@ static gdouble loop_min_width_frames(Recorder *r) {
   gdouble rate = 44100.0;
 
   g_mutex_lock(&r->mutex);
-  rate = r->sample_rate ? (gdouble)r->sample_rate : 44100.0;
+  rate = r->audio.sample_rate ? (gdouble)r->audio.sample_rate : 44100.0;
   g_mutex_unlock(&r->mutex);
 
   return MAX(0.25 * rate, 1.0);
@@ -515,7 +523,7 @@ static gdouble clamp_loop_frame(Recorder *r, gdouble frame) {
   gdouble total_frames = 0.0;
 
   g_mutex_lock(&r->mutex);
-  total_frames = (gdouble)r->captured_frames;
+  total_frames = (gdouble)r->audio.captured_frames;
   g_mutex_unlock(&r->mutex);
 
   if (frame < 0.0) {
@@ -528,8 +536,8 @@ static gdouble clamp_loop_frame(Recorder *r, gdouble frame) {
 }
 
 static gboolean get_effective_loop_region_locked(Recorder *r, gdouble total_frames, gdouble *start_frames, gdouble *end_frames) {
-  gdouble start = r->loop_region_set ? r->loop_start_frames : 0.0;
-  gdouble end = r->loop_region_set ? r->loop_end_frames : total_frames;
+  gdouble start = r->loop.region_set ? r->loop.start_frames : 0.0;
+  gdouble end = r->loop.region_set ? r->loop.end_frames : total_frames;
 
   if (total_frames <= 0.0) {
     return FALSE;
@@ -567,9 +575,9 @@ static LoopSnapshot get_loop_snapshot(Recorder *r) {
   LoopSnapshot snapshot = {0};
 
   g_mutex_lock(&r->mutex);
-  snapshot.enabled = r->loop_enabled;
-  snapshot.explicit_region_set = r->loop_region_set;
-  snapshot.total_frames = (gdouble)r->captured_frames;
+  snapshot.enabled = r->loop.enabled;
+  snapshot.explicit_region_set = r->loop.region_set;
+  snapshot.total_frames = (gdouble)r->audio.captured_frames;
   snapshot.effective_region_set = get_effective_loop_region_locked(r,
                                                                     snapshot.total_frames,
                                                                     &snapshot.start_frames,
@@ -593,7 +601,7 @@ static void finalize_loop_region(Recorder *r, gdouble start_frames, gdouble end_
   end_frames = clamp_loop_frame(r, end_frames);
 
   g_mutex_lock(&r->mutex);
-  total_frames = (gdouble)r->captured_frames;
+  total_frames = (gdouble)r->audio.captured_frames;
   g_mutex_unlock(&r->mutex);
 
   if (end_frames - start_frames < min_width) {
@@ -619,17 +627,17 @@ static void finalize_loop_region(Recorder *r, gdouble start_frames, gdouble end_
 
 static void set_loop_drag(Recorder *r, LoopDragMode mode, gdouble anchor_frames, gdouble offset_frames) {
   g_mutex_lock(&r->mutex);
-  r->loop_drag_mode = mode;
-  r->loop_drag_anchor_frames = anchor_frames;
-  r->loop_drag_offset_frames = offset_frames;
+  r->loop.drag_mode = mode;
+  r->loop.drag_anchor_frames = anchor_frames;
+  r->loop.drag_offset_frames = offset_frames;
   g_mutex_unlock(&r->mutex);
 }
 
 static void clear_loop_drag(Recorder *r) {
   g_mutex_lock(&r->mutex);
-  r->loop_drag_mode = LOOP_DRAG_NONE;
-  r->loop_drag_anchor_frames = 0.0;
-  r->loop_drag_offset_frames = 0.0;
+  r->loop.drag_mode = LOOP_DRAG_NONE;
+  r->loop.drag_anchor_frames = 0.0;
+  r->loop.drag_offset_frames = 0.0;
   g_mutex_unlock(&r->mutex);
 }
 
@@ -1062,13 +1070,13 @@ static gpointer capture_thread_main(gpointer user_data) {
     g_printerr("[capture] chunk read: %zu bytes\n", buffer_size);
 
     if (mode == MODE_RECORDING) {
-      const guint frame_size = rec->channels * sizeof(gint16);
+      const guint frame_size = rec->audio.channels * sizeof(gint16);
       const guint chunk_frames = 256;
       const guint chunk_bytes = chunk_frames * frame_size;
 
       g_mutex_lock(&rec->mutex);
-      g_byte_array_append(rec->pcm, buffer, buffer_size);
-      rec->captured_frames += buffer_size / (rec->channels * sizeof(gint16));
+      g_byte_array_append(rec->audio.pcm, buffer, buffer_size);
+      rec->audio.captured_frames += buffer_size / (rec->audio.channels * sizeof(gint16));
 
       for (gsize offset = 0; offset < buffer_size; offset += chunk_bytes) {
         gsize remaining = buffer_size - offset;
@@ -1077,7 +1085,7 @@ static gpointer capture_thread_main(gpointer user_data) {
 
         for (gsize i = 0; i + frame_size <= this_bytes; i += frame_size) {
           const gint16 *frame = (const gint16 *)(buffer + offset + i);
-          for (guint c = 0; c < rec->channels; c++) {
+          for (guint c = 0; c < rec->audio.channels; c++) {
             gint16 sample = frame[c];
             guint16 abs_sample = (sample < 0) ? (guint16)(-sample) : (guint16)sample;
             if (abs_sample > peak) {
@@ -1086,7 +1094,7 @@ static gpointer capture_thread_main(gpointer user_data) {
           }
         }
 
-        g_array_append_val(rec->wave_peaks, peak);
+        g_array_append_val(rec->audio.wave_peaks, peak);
       }
 
       g_mutex_unlock(&rec->mutex);
@@ -1137,15 +1145,15 @@ static gpointer playback_thread_main(gpointer user_data) {
   g_printerr("[playback] thread started\n");
 
   g_mutex_lock(&rec->mutex);
-  if (rec->pcm->len > 0) {
-    g_byte_array_append(snapshot, rec->pcm->data, rec->pcm->len);
+  if (rec->audio.pcm->len > 0) {
+    g_byte_array_append(snapshot, rec->audio.pcm->data, rec->audio.pcm->len);
   }
-  sample_rate = rec->sample_rate;
-  channels = rec->channels;
+  sample_rate = rec->audio.sample_rate;
+  channels = rec->audio.channels;
   speed = rec->speed;
   cursor_frames = rec->playback_cursor_frames;
-  loop_enabled = rec->loop_enabled;
-  loop_region_set = rec->loop_region_set;
+  loop_enabled = rec->loop.enabled;
+  loop_region_set = rec->loop.region_set;
   g_mutex_unlock(&rec->mutex);
 
   if (snapshot->len == 0) {
@@ -1290,7 +1298,7 @@ static gpointer playback_thread_main(gpointer user_data) {
       guint64 desired_end_frame = total_frames;
 
       g_mutex_lock(&rec->mutex);
-      live_loop_enabled = rec->loop_enabled;
+      live_loop_enabled = rec->loop.enabled;
       live_loop_region_set = get_effective_loop_region_locked(rec, (gdouble)total_frames, &live_loop_start, &live_loop_end);
       g_mutex_unlock(&rec->mutex);
 
@@ -1500,9 +1508,9 @@ static gboolean start_capture_thread(Recorder *r, gboolean reset_buffers) {
   }
 
   if (reset_buffers) {
-    g_byte_array_set_size(r->pcm, 0);
-    g_array_set_size(r->wave_peaks, 0);
-    r->captured_frames = 0;
+    g_byte_array_set_size(r->audio.pcm, 0);
+    g_array_set_size(r->audio.wave_peaks, 0);
+    r->audio.captured_frames = 0;
   }
   r->stop_requested = FALSE;
   r->capture_running = TRUE;
@@ -1525,7 +1533,7 @@ static gboolean start_playback_thread(Recorder *r) {
     return TRUE;
   }
 
-  if (r->pcm->len == 0) {
+  if (r->audio.pcm->len == 0) {
     g_mutex_unlock(&r->mutex);
     set_error(r, "Nothing has been recorded yet");
     return FALSE;
@@ -1742,7 +1750,7 @@ static void on_loop_toggled(GtkToggleButton *button, gpointer user_data) {
   gboolean active = gtk_toggle_button_get_active(button);
 
   g_mutex_lock(&r->mutex);
-  r->loop_enabled = active;
+  r->loop.enabled = active;
   g_mutex_unlock(&r->mutex);
 
   refresh_ui(r);
@@ -1752,9 +1760,9 @@ static guint16 *copy_wave_peaks(Recorder *r, gsize *peak_count) {
   guint16 *peaks = NULL;
 
   g_mutex_lock(&r->mutex);
-  *peak_count = r->wave_peaks->len;
+  *peak_count = r->audio.wave_peaks->len;
   if (*peak_count > 0) {
-    peaks = g_memdup2(r->wave_peaks->data, *peak_count * sizeof *peaks);
+    peaks = g_memdup2(r->audio.wave_peaks->data, *peak_count * sizeof *peaks);
   }
   g_mutex_unlock(&r->mutex);
 
@@ -1917,7 +1925,7 @@ static gboolean on_waveform_button_press(GtkWidget *widget, GdkEventButton *even
   }
 
   g_mutex_lock(&r->mutex);
-  total_frames = (gdouble)r->captured_frames;
+  total_frames = (gdouble)r->audio.captured_frames;
   shift = (event->state & GDK_SHIFT_MASK) != 0;
   effective_region_set = get_effective_loop_region_locked(r, total_frames, &loop_start, &loop_end);
   g_mutex_unlock(&r->mutex);
@@ -1982,10 +1990,10 @@ static gboolean on_waveform_button_release(GtkWidget *widget, GdkEventButton *ev
   release_scrub_pointer(widget, event);
 
   g_mutex_lock(&r->mutex);
-  drag_mode = r->loop_drag_mode;
-  drag_anchor = r->loop_drag_anchor_frames;
-  drag_offset = r->loop_drag_offset_frames;
-  total_frames = (gdouble)r->captured_frames;
+  drag_mode = r->loop.drag_mode;
+  drag_anchor = r->loop.drag_anchor_frames;
+  drag_offset = r->loop.drag_offset_frames;
+  total_frames = (gdouble)r->audio.captured_frames;
   get_effective_loop_region_locked(r, total_frames, &loop_start, &loop_end);
   g_mutex_unlock(&r->mutex);
 
@@ -2041,10 +2049,10 @@ static gboolean on_waveform_motion(GtkWidget *widget, GdkEventMotion *event, gpo
 
   g_mutex_lock(&r->mutex);
   scrubbing = r->scrubbing;
-  drag_mode = r->loop_drag_mode;
-  drag_anchor = r->loop_drag_anchor_frames;
-  drag_offset = r->loop_drag_offset_frames;
-  total_frames = (gdouble)r->captured_frames;
+  drag_mode = r->loop.drag_mode;
+  drag_anchor = r->loop.drag_anchor_frames;
+  drag_offset = r->loop.drag_offset_frames;
+  total_frames = (gdouble)r->audio.captured_frames;
   get_effective_loop_region_locked(r, total_frames, &loop_start, &loop_end);
   g_mutex_unlock(&r->mutex);
 
@@ -2107,11 +2115,11 @@ static void on_window_destroy(GtkWidget *widget, gpointer user_data) {
   stop_capture_thread(r, TRUE);
 
   g_mutex_clear(&r->mutex);
-  if (r->pcm) {
-    g_byte_array_unref(r->pcm);
+  if (r->audio.pcm) {
+    g_byte_array_unref(r->audio.pcm);
   }
-  if (r->wave_peaks) {
-    g_array_unref(r->wave_peaks);
+  if (r->audio.wave_peaks) {
+    g_array_unref(r->audio.wave_peaks);
   }
   g_free(r);
 }
@@ -2144,10 +2152,10 @@ static void activate(GtkApplication *app, gpointer user_data) {
   r->widgets.play_pause_button = play_pause_button;
   r->widgets.loop_button = loop_button;
   r->widgets.stop_button = stop_button;
-  r->sample_rate = 44100;
-  r->channels = 2;
-  r->pcm = g_byte_array_new();
-  r->wave_peaks = g_array_new(FALSE, FALSE, sizeof(guint16));
+  r->audio.sample_rate = 44100;
+  r->audio.channels = 2;
+  r->audio.pcm = g_byte_array_new();
+  r->audio.wave_peaks = g_array_new(FALSE, FALSE, sizeof(guint16));
   r->speed = 1.0;
   r->playback_cursor_frames = 0.0;
   r->playback_anchor_frames = 0.0;
