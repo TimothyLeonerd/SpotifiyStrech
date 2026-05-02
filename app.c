@@ -61,10 +61,14 @@ typedef struct {
 
 typedef struct {
   GByteArray *pcm;
+  GByteArray *playback_pcm;
   GArray *wave_peaks;
   guint sample_rate;
   guint channels;
   guint64 captured_frames;
+  gdouble playback_rendered_to_source_ratio;
+  gdouble playback_speed;
+  gboolean playback_valid;
 } AudioBuffer;
 
 typedef struct {
@@ -840,6 +844,75 @@ cleanup:
   return output;
 }
 
+static void invalidate_playback_buffer_locked(Recorder *r) {
+  r->audio.playback_valid = FALSE;
+}
+
+static gboolean ensure_playback_buffer(Recorder *r) {
+  GByteArray *source_snapshot = NULL;
+  GByteArray *rendered = NULL;
+  guint sample_rate = 44100;
+  guint channels = 2;
+  guint64 source_frames = 0;
+  guint64 rendered_frames = 0;
+  gdouble speed = 1.0;
+  gboolean cancelled = FALSE;
+
+  g_mutex_lock(&r->mutex);
+  if (r->audio.playback_valid && r->audio.playback_pcm && r->audio.playback_speed == r->speed) {
+    g_mutex_unlock(&r->mutex);
+    return TRUE;
+  }
+
+  if (r->audio.pcm->len == 0) {
+    g_mutex_unlock(&r->mutex);
+    set_error(r, "Nothing has been recorded yet");
+    return FALSE;
+  }
+
+  source_snapshot = g_byte_array_new();
+  g_byte_array_append(source_snapshot, r->audio.pcm->data, r->audio.pcm->len);
+  sample_rate = r->audio.sample_rate;
+  channels = r->audio.channels;
+  source_frames = r->audio.captured_frames;
+  speed = r->speed;
+  g_mutex_unlock(&r->mutex);
+
+  rendered = render_stretched_pcm(r, source_snapshot, sample_rate, channels, 0, source_frames, speed, &cancelled);
+  g_byte_array_unref(source_snapshot);
+
+  if (cancelled) {
+    return FALSE;
+  }
+  if (!rendered) {
+    return FALSE;
+  }
+
+  rendered_frames = rendered->len / (channels * sizeof(gint16));
+  if (rendered_frames == 0) {
+    g_byte_array_unref(rendered);
+    set_error(r, "Rubber Band produced no playback audio");
+    return FALSE;
+  }
+
+  g_mutex_lock(&r->mutex);
+  if (r->speed != speed || r->audio.captured_frames != source_frames) {
+    g_mutex_unlock(&r->mutex);
+    g_byte_array_unref(rendered);
+    return ensure_playback_buffer(r);
+  }
+  if (r->audio.playback_pcm) {
+    g_byte_array_unref(r->audio.playback_pcm);
+  }
+  r->audio.playback_pcm = rendered;
+  r->audio.playback_rendered_to_source_ratio = (gdouble)source_frames / (gdouble)rendered_frames;
+  r->audio.playback_speed = speed;
+  r->audio.playback_valid = TRUE;
+  g_mutex_unlock(&r->mutex);
+
+  return TRUE;
+}
+
 typedef struct {
   gboolean ready;
   gboolean done;
@@ -1077,6 +1150,7 @@ static gpointer capture_thread_main(gpointer user_data) {
       g_mutex_lock(&rec->mutex);
       g_byte_array_append(rec->audio.pcm, buffer, buffer_size);
       rec->audio.captured_frames += buffer_size / (rec->audio.channels * sizeof(gint16));
+      invalidate_playback_buffer_locked(rec);
 
       for (gsize offset = 0; offset < buffer_size; offset += chunk_bytes) {
         gsize remaining = buffer_size - offset;
@@ -1122,13 +1196,12 @@ cleanup:
 static gpointer playback_thread_main(gpointer user_data) {
   Recorder *rec = user_data;
   GByteArray *snapshot = g_byte_array_new();
-  GByteArray *rendered = NULL;
   guint sample_rate = 44100;
   guint channels = 2;
-  gdouble speed = 1.0;
   gdouble cursor_frames = 0.0;
   gdouble source_cursor_frame = 0.0;
   gdouble final_cursor_frames = 0.0;
+  gdouble rendered_to_source_ratio = 1.0;
   gboolean loop_enabled = FALSE;
   gboolean loop_region_set = FALSE;
   pa_threaded_mainloop *ml = NULL;
@@ -1138,20 +1211,22 @@ static gpointer playback_thread_main(gpointer user_data) {
   pa_buffer_attr attr;
   gboolean reached_end = FALSE;
   gboolean flush_on_exit = FALSE;
-  gboolean cancelled = FALSE;
   guint64 total_frames = 0;
+  guint64 playback_frames = 0;
+  guint64 output_frames_played = 0;
   PulseQuery query = {0};
 
   g_printerr("[playback] thread started\n");
 
   g_mutex_lock(&rec->mutex);
-  if (rec->audio.pcm->len > 0) {
-    g_byte_array_append(snapshot, rec->audio.pcm->data, rec->audio.pcm->len);
+  if (rec->audio.playback_pcm && rec->audio.playback_pcm->len > 0) {
+    g_byte_array_append(snapshot, rec->audio.playback_pcm->data, rec->audio.playback_pcm->len);
   }
   sample_rate = rec->audio.sample_rate;
   channels = rec->audio.channels;
-  speed = rec->speed;
   cursor_frames = rec->playback_cursor_frames;
+  rendered_to_source_ratio = rec->audio.playback_rendered_to_source_ratio > 0.0 ? rec->audio.playback_rendered_to_source_ratio : 1.0;
+  total_frames = rec->audio.captured_frames;
   loop_enabled = rec->loop.enabled;
   loop_region_set = rec->loop.region_set;
   g_mutex_unlock(&rec->mutex);
@@ -1161,20 +1236,22 @@ static gpointer playback_thread_main(gpointer user_data) {
     goto cleanup;
   }
 
-  {
-    total_frames = snapshot->len / (channels * sizeof(gint16));
-    if (cursor_frames < 0.0) {
-      cursor_frames = 0.0;
-    }
-    if (cursor_frames > (gdouble)total_frames) {
-      cursor_frames = (gdouble)total_frames;
-    }
-    source_cursor_frame = cursor_frames;
-    final_cursor_frames = source_cursor_frame;
-
-    g_printerr("[playback] source setup start=%.1f end=%" G_GUINT64_FORMAT " loop=%d region=%d\n",
-               source_cursor_frame, total_frames, loop_enabled ? 1 : 0, loop_region_set ? 1 : 0);
+  playback_frames = snapshot->len / (channels * sizeof(gint16));
+  if (cursor_frames < 0.0) {
+    cursor_frames = 0.0;
   }
+  if (cursor_frames > (gdouble)total_frames) {
+    cursor_frames = (gdouble)total_frames;
+  }
+  source_cursor_frame = cursor_frames;
+  final_cursor_frames = source_cursor_frame;
+  output_frames_played = (guint64)(source_cursor_frame / rendered_to_source_ratio);
+  if (output_frames_played > playback_frames) {
+    output_frames_played = playback_frames;
+  }
+
+  g_printerr("[playback] source setup start=%.1f end=%" G_GUINT64_FORMAT " loop=%d region=%d\n",
+             source_cursor_frame, total_frames, loop_enabled ? 1 : 0, loop_region_set ? 1 : 0);
 
   ss.format = PA_SAMPLE_S16LE;
   ss.rate = sample_rate;
@@ -1264,16 +1341,10 @@ static gpointer playback_thread_main(gpointer user_data) {
     goto fail_locked;
   }
 
-  g_printerr("[playback] opened async stream at %.1fx\n", speed);
+  g_printerr("[playback] opened async stream\n");
 
   {
     const guint frame_size = channels * sizeof(gint16);
-    const guint8 *rendered_data = NULL;
-    guint64 segment_start_frame = 0;
-    guint64 segment_end_frame = 0;
-    guint64 segment_rendered_frames = 0;
-    guint64 output_frames_played = 0;
-    gdouble segment_progress_ratio = 1.0;
     gboolean loop_armed = FALSE;
 
     g_mutex_lock(&rec->mutex);
@@ -1294,8 +1365,6 @@ static gpointer playback_thread_main(gpointer user_data) {
       guint64 live_loop_start_frame = 0;
       guint64 live_loop_end_frame = 0;
       gboolean live_loop_valid = FALSE;
-      guint64 desired_start_frame = 0;
-      guint64 desired_end_frame = total_frames;
 
       g_mutex_lock(&rec->mutex);
       live_loop_enabled = rec->loop.enabled;
@@ -1310,10 +1379,9 @@ static gpointer playback_thread_main(gpointer user_data) {
       if (live_loop_valid && loop_armed && source_cursor_frame >= (gdouble)live_loop_end_frame) {
         source_cursor_frame = (gdouble)live_loop_start_frame;
         final_cursor_frames = source_cursor_frame;
-        rendered_data = NULL;
-        if (rendered) {
-          g_byte_array_unref(rendered);
-          rendered = NULL;
+        output_frames_played = (guint64)(source_cursor_frame / rendered_to_source_ratio);
+        if (output_frames_played > playback_frames) {
+          output_frames_played = playback_frames;
         }
         g_mutex_lock(&rec->mutex);
         rec->playback_cursor_frames = source_cursor_frame;
@@ -1334,46 +1402,8 @@ static gpointer playback_thread_main(gpointer user_data) {
         break;
       }
 
-      desired_start_frame = (guint64)source_cursor_frame;
-      desired_end_frame = total_frames;
       if (live_loop_valid && source_cursor_frame < (gdouble)live_loop_end_frame) {
         loop_armed = TRUE;
-        desired_end_frame = live_loop_end_frame;
-      }
-
-      if (desired_start_frame >= desired_end_frame) {
-        source_cursor_frame = (gdouble)desired_end_frame;
-        continue;
-      }
-
-      if (!rendered ||
-          output_frames_played >= segment_rendered_frames ||
-          source_cursor_frame < (gdouble)segment_start_frame ||
-          source_cursor_frame > (gdouble)segment_end_frame) {
-        if (rendered) {
-          g_byte_array_unref(rendered);
-          rendered = NULL;
-        }
-
-        rendered = render_stretched_pcm(rec, snapshot, sample_rate, channels, desired_start_frame, desired_end_frame, speed, &cancelled);
-        if (cancelled) {
-          goto fail_locked;
-        }
-        if (!rendered) {
-          goto fail_locked;
-        }
-
-        segment_rendered_frames = rendered->len / frame_size;
-        if (segment_rendered_frames == 0) {
-          set_error(rec, "Rubber Band produced no playback audio");
-          goto fail_locked;
-        }
-
-        segment_start_frame = desired_start_frame;
-        segment_end_frame = desired_end_frame;
-        segment_progress_ratio = (gdouble)(segment_end_frame - segment_start_frame) / (gdouble)segment_rendered_frames;
-        output_frames_played = 0;
-        rendered_data = rendered->data;
       }
 
       stop_requested = playback_should_stop(rec);
@@ -1389,12 +1419,24 @@ static gpointer playback_thread_main(gpointer user_data) {
 
       guint writable = pa_stream_writable_size(stream);
       guint out_frames = MIN(128u, writable / frame_size);
+      if (live_loop_valid && loop_armed && source_cursor_frame < (gdouble)live_loop_end_frame) {
+        guint64 loop_end_output_frame = (guint64)ceil((gdouble)live_loop_end_frame / rendered_to_source_ratio);
+        if (loop_end_output_frame < output_frames_played) {
+          loop_end_output_frame = output_frames_played;
+        }
+        if (output_frames_played + out_frames > loop_end_output_frame) {
+          out_frames = (guint)(loop_end_output_frame - output_frames_played);
+        }
+      }
       if (out_frames == 0) {
+        if (live_loop_valid && loop_armed) {
+          source_cursor_frame = (gdouble)live_loop_end_frame;
+        }
         continue;
       }
 
-      if (output_frames_played + out_frames > segment_rendered_frames) {
-        out_frames = (guint)(segment_rendered_frames - output_frames_played);
+      if (output_frames_played + out_frames > playback_frames) {
+        out_frames = (guint)(playback_frames - output_frames_played);
       }
 
       if (out_frames == 0) {
@@ -1402,7 +1444,7 @@ static gpointer playback_thread_main(gpointer user_data) {
       }
 
       if (pa_stream_write(stream,
-                          rendered_data + (output_frames_played * frame_size),
+                          snapshot->data + (output_frames_played * frame_size),
                           out_frames * frame_size,
                           NULL,
                           0,
@@ -1412,9 +1454,9 @@ static gpointer playback_thread_main(gpointer user_data) {
       }
 
       output_frames_played += out_frames;
-      source_cursor_frame = (gdouble)segment_start_frame + ((gdouble)output_frames_played * segment_progress_ratio);
-      if (source_cursor_frame > (gdouble)segment_end_frame) {
-        source_cursor_frame = (gdouble)segment_end_frame;
+      source_cursor_frame = (gdouble)output_frames_played * rendered_to_source_ratio;
+      if (source_cursor_frame > (gdouble)total_frames) {
+        source_cursor_frame = (gdouble)total_frames;
       }
 
       g_mutex_lock(&rec->mutex);
@@ -1461,9 +1503,6 @@ fail_locked:
 
 cleanup:
   g_byte_array_unref(snapshot);
-  if (rendered) {
-    g_byte_array_unref(rendered);
-  }
 
   if (ml) {
     pa_threaded_mainloop_stop(ml);
@@ -1511,6 +1550,7 @@ static gboolean start_capture_thread(Recorder *r, gboolean reset_buffers) {
     g_byte_array_set_size(r->audio.pcm, 0);
     g_array_set_size(r->audio.wave_peaks, 0);
     r->audio.captured_frames = 0;
+    invalidate_playback_buffer_locked(r);
   }
   r->stop_requested = FALSE;
   r->capture_running = TRUE;
@@ -1538,7 +1578,17 @@ static gboolean start_playback_thread(Recorder *r) {
     set_error(r, "Nothing has been recorded yet");
     return FALSE;
   }
+  g_mutex_unlock(&r->mutex);
 
+  if (!ensure_playback_buffer(r)) {
+    return FALSE;
+  }
+
+  g_mutex_lock(&r->mutex);
+  if (r->playback_running) {
+    g_mutex_unlock(&r->mutex);
+    return TRUE;
+  }
   r->playback_stop_requested = FALSE;
   r->playback_running = TRUE;
   r->mode = MODE_PREPARING;
@@ -1706,7 +1756,10 @@ static void transport_set_speed(Recorder *r, gdouble speed) {
   gboolean restart_playback = FALSE;
 
   g_mutex_lock(&r->mutex);
-  r->speed = speed;
+  if (r->speed != speed) {
+    r->speed = speed;
+    invalidate_playback_buffer_locked(r);
+  }
   restart_playback = (r->mode == MODE_PLAYING);
   g_mutex_unlock(&r->mutex);
 
@@ -2118,6 +2171,9 @@ static void on_window_destroy(GtkWidget *widget, gpointer user_data) {
   if (r->audio.pcm) {
     g_byte_array_unref(r->audio.pcm);
   }
+  if (r->audio.playback_pcm) {
+    g_byte_array_unref(r->audio.playback_pcm);
+  }
   if (r->audio.wave_peaks) {
     g_array_unref(r->audio.wave_peaks);
   }
@@ -2155,7 +2211,11 @@ static void activate(GtkApplication *app, gpointer user_data) {
   r->audio.sample_rate = 44100;
   r->audio.channels = 2;
   r->audio.pcm = g_byte_array_new();
+  r->audio.playback_pcm = NULL;
   r->audio.wave_peaks = g_array_new(FALSE, FALSE, sizeof(guint16));
+  r->audio.playback_rendered_to_source_ratio = 1.0;
+  r->audio.playback_speed = 1.0;
+  r->audio.playback_valid = FALSE;
   r->speed = 1.0;
   r->playback_cursor_frames = 0.0;
   r->playback_anchor_frames = 0.0;
