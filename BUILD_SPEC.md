@@ -123,6 +123,19 @@ Suggested data for visualization:
 
 Use locks or message passing carefully. Keep the UI responsive.
 
+## Common Issues Found During Loop Implementation
+
+- Keep UI state edits pure. Toggling loop should only change `loop_enabled`; dragging a marker should only change the loop boundary value.
+- Do not let UI edits directly restart playback, reset the cursor, or invalidate active audio unless the user explicitly seeks/stops/starts.
+- Treat playback position as a source-frame cursor. Rendered/time-stretched buffers are derived implementation details and must not become the source of truth for transport state.
+- Avoid separate hidden meanings for visible loop markers. If the UI draws full-buffer loop handles, playback and hit testing must treat `0..captured_frames` as the effective loop region too.
+- Do not represent the same concept in two places without a clear rule. `loop_region_set == false` plus visible full-width markers caused playback and UI to disagree.
+- Playback should consult loop state only at boundary decisions. Loop state can decide whether the next boundary wraps, but should not cause immediate cursor movement while playback is mid-segment.
+- Avoid coupling loop edits to segment rendering. Re-rendering a stretched segment during marker drag can re-anchor output offsets and make audio/playhead jump.
+- Be careful with lock ownership. Do not call helper functions that lock `Recorder.mutex` while already holding that mutex.
+- Keep transport and loop concerns separate. Scrubbing/seeking changes playback cursor; loop editing changes loop boundaries.
+- If a full architecture refactor happens, split state into transport state, loop state, playback engine, waveform view, and GTK controller instead of letting all callbacks mutate one shared struct arbitrarily.
+
 ## Recommended Stack
 
 - C or C++ on Linux

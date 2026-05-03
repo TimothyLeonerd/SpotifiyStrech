@@ -20,11 +20,14 @@ $(RUBBERBAND_BUILD)/build.ninja: $(RUBBERBAND_DIR)/meson.build $(RUBBERBAND_DIR)
 $(RUBBERBAND_LIB): $(RUBBERBAND_BUILD)/build.ninja
 	meson compile -C "$(RUBBERBAND_BUILD)"
 
-app.o: app.c $(RUBBERBAND_LIB)
+core.o: core.c core.h
+	$(CC) $(CFLAGS) $(GTK_CFLAGS) $(PULSE_CFLAGS) -c -o $@ $<
+
+app.o: app.c core.h $(RUBBERBAND_LIB)
 	$(CC) $(CFLAGS) $(GTK_CFLAGS) $(PULSE_CFLAGS) $(RUBBERBAND_CFLAGS) -c -o $@ $<
 
-$(TARGET): app.o $(RUBBERBAND_LIB)
-	$(CXX) -o $@ app.o $(RUBBERBAND_LIB) $(GTK_LIBS) $(PULSE_LIBS) -lm -pthread
+$(TARGET): core.o app.o $(RUBBERBAND_LIB)
+	$(CXX) -o $@ core.o app.o $(RUBBERBAND_LIB) $(GTK_LIBS) $(PULSE_LIBS) -lm -pthread
 
 clean:
 	rm -f $(TARGET) *.o *.wav

@@ -36,3 +36,4 @@ The current app is a UI scaffold with Record, Pause, Stop, Play, and speed contr
 - This records everything playing on your output device, not just Spotify.
 - Stop with `Ctrl-C`.
 - The longer-term goal is an app with an in-memory buffer, waveform display, and speed control.
+- Loop/transport implementation lessons are documented in `BUILD_SPEC.md` and regression checks are in `IMPLEMENTATION_CHECKLIST.md`.
