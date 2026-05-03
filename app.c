@@ -101,12 +101,35 @@ typedef struct {
   gboolean render_pending;
   AppMode render_source_mode;
   gboolean render_button_was_play;
-  gboolean render_auto_play;
   gdouble render_seek_pending;
   GThread *render_thread;
   guint render_pulse_source;
   gdouble render_progress;
+  guint render_generation;
 } Recorder;
+
+typedef enum {
+  RENDER_OUTCOME_SUCCESS,
+  RENDER_OUTCOME_CANCELLED,
+  RENDER_OUTCOME_FAILED,
+} RenderOutcome;
+
+typedef struct {
+  Recorder *rec;
+  guint generation;
+  RenderOutcome outcome;
+  GByteArray *playback_pcm;
+  guint64 source_frames;
+  guint64 rendered_frames;
+  gdouble speed;
+  gdouble seek_pos;
+  char error[256];
+} RenderCompletion;
+
+typedef struct {
+  Recorder *rec;
+  guint generation;
+} RenderProgressUpdate;
 
 static const char *mode_to_text(AppMode mode) {
   switch (mode) {
@@ -172,7 +195,7 @@ static void update_button_sensitivity(Recorder *r) {
       stop_enabled = TRUE;
       loop_enabled = TRUE;
       play_pause_enabled = TRUE;
-      play_pause_label = r->render_button_was_play ? "Play" : "Pause";
+      play_pause_label = r->render_button_was_play ? "Pause" : "Play";
       break;
   }
   g_mutex_unlock(&r->mutex);
@@ -193,6 +216,8 @@ static void set_mode(Recorder *r, AppMode mode) {
 static gdouble get_current_playback_frames(Recorder *r);
 static double get_playhead_ratio(Recorder *r);
 static gboolean start_playback_thread(Recorder *r);
+static gboolean start_playback_with_ready_buffer(Recorder *r);
+static gpointer playback_thread_main(gpointer user_data);
 static void stop_playback_thread(Recorder *r, gboolean reset_cursor);
 
 static void update_display_playhead(Recorder *r) {
@@ -872,12 +897,95 @@ static void invalidate_playback_buffer_locked(Recorder *r) {
 static gboolean start_playback_thread(Recorder *r);
 
 static gboolean update_render_progress_idle(gpointer data) {
-  Recorder *r = data;
+  RenderProgressUpdate *update = data;
+  Recorder *r = update->rec;
   gdouble progress = 0.0;
+  gboolean valid_generation = FALSE;
+
   g_mutex_lock(&r->mutex);
+  valid_generation = (r->render_generation == update->generation);
   progress = r->render_progress;
   g_mutex_unlock(&r->mutex);
-  gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(r->widgets.progress_bar), progress);
+
+  if (valid_generation) {
+    gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(r->widgets.progress_bar), progress);
+  }
+
+  g_free(update);
+  return FALSE;
+}
+
+static gboolean render_completion_idle_cb(gpointer data) {
+  RenderCompletion *completion = data;
+  Recorder *r = completion->rec;
+  gboolean valid_generation = FALSE;
+  gboolean should_play = FALSE;
+
+  g_mutex_lock(&r->mutex);
+  valid_generation = (r->render_generation == completion->generation);
+  if (valid_generation) {
+    r->render_pending = FALSE;
+    r->render_thread = NULL;
+    r->render_pulse_source = 0;
+    r->render_progress = 1.0;
+    if (completion->outcome == RENDER_OUTCOME_FAILED) {
+      r->mode = MODE_IDLE;
+    }
+    should_play = r->render_button_was_play;
+  }
+  g_mutex_unlock(&r->mutex);
+
+  if (!valid_generation) {
+    if (completion->playback_pcm) {
+      g_byte_array_unref(completion->playback_pcm);
+    }
+    g_free(completion);
+    return FALSE;
+  }
+
+  gtk_widget_hide(r->widgets.progress_bar);
+
+  if (completion->outcome == RENDER_OUTCOME_FAILED) {
+    set_error(r, completion->error);
+    refresh_ui(r);
+  } else if (completion->outcome == RENDER_OUTCOME_CANCELLED) {
+    refresh_ui(r);
+  } else {
+    g_mutex_lock(&r->mutex);
+    if (r->audio.playback_pcm) {
+      g_byte_array_unref(r->audio.playback_pcm);
+    }
+    r->audio.playback_pcm = completion->playback_pcm;
+    r->audio.playback_rendered_to_source_ratio = completion->rendered_frames > 0
+      ? (gdouble)completion->source_frames / (gdouble)completion->rendered_frames
+      : 1.0;
+    r->audio.playback_speed = completion->speed;
+    r->audio.playback_valid = TRUE;
+    if (completion->seek_pos >= 0.0) {
+      r->playback_cursor_frames = completion->seek_pos;
+      r->display_playhead_frames = completion->seek_pos;
+    }
+    if (should_play) {
+      r->mode = MODE_IDLE;
+    } else {
+      r->mode = (r->render_source_mode == MODE_PLAYING) ? MODE_PAUSED : r->render_source_mode;
+    }
+    completion->playback_pcm = NULL;
+    g_mutex_unlock(&r->mutex);
+    if (should_play) {
+      if (!start_playback_with_ready_buffer(r)) {
+        set_error(r, "Failed to start playback after render");
+        refresh_ui(r);
+      }
+    } else {
+      refresh_ui(r);
+    }
+  }
+
+  if (completion->playback_pcm) {
+    g_byte_array_unref(completion->playback_pcm);
+  }
+  g_free(completion);
   return FALSE;
 }
 
@@ -890,38 +998,36 @@ static gpointer render_thread_main(gpointer data) {
   guint64 source_frames = 0;
   gdouble speed = 1.0;
   gdouble seek_pos = -1.0;
-  gboolean should_play = FALSE;
   gboolean cancelled = FALSE;
-
-  guint64 chunk_frames = sample_rate;
+  guint64 chunk_frames = 0;
   guint64 num_chunks = 0;
   guint64 chunk_idx = 0;
+  guint my_generation = 0;
+  RenderCompletion *completion = NULL;
 
   g_mutex_lock(&r->mutex);
+  my_generation = r->render_generation;
   source_snapshot = g_byte_array_new();
   g_byte_array_append(source_snapshot, r->audio.pcm->data, r->audio.pcm->len);
   sample_rate = r->audio.sample_rate;
   channels = r->audio.channels;
   source_frames = r->audio.captured_frames;
   speed = r->speed;
-  should_play = r->render_auto_play;
   seek_pos = r->render_seek_pending;
   r->render_progress = 0.0;
   g_mutex_unlock(&r->mutex);
 
+  chunk_frames = sample_rate;
+
   num_chunks = (source_frames + chunk_frames - 1) / chunk_frames;
   if (num_chunks == 0) {
     g_byte_array_unref(source_snapshot);
-    g_mutex_lock(&r->mutex);
-    guint source = r->render_pulse_source;
-    r->render_pending = FALSE;
-    r->render_pulse_source = 0;
-    r->mode = MODE_IDLE;
-    g_mutex_unlock(&r->mutex);
-    if (source) g_source_remove(source);
-    gtk_widget_hide(r->widgets.progress_bar);
-    set_error(r, "No audio to render");
-    refresh_ui(r);
+    completion = g_new0(RenderCompletion, 1);
+    completion->rec = r;
+    completion->generation = my_generation;
+    completion->outcome = RENDER_OUTCOME_FAILED;
+    g_strlcpy(completion->error, "No audio to render", sizeof completion->error);
+    g_idle_add(render_completion_idle_cb, completion);
     return NULL;
   }
 
@@ -955,70 +1061,52 @@ static gpointer render_thread_main(gpointer data) {
     g_mutex_lock(&r->mutex);
     r->render_progress = (gdouble)(chunk_idx + 1) / (gdouble)num_chunks;
     g_mutex_unlock(&r->mutex);
-    g_idle_add(update_render_progress_idle, r);
+    RenderProgressUpdate *progress_update = g_new0(RenderProgressUpdate, 1);
+    progress_update->rec = r;
+    progress_update->generation = my_generation;
+    g_idle_add(update_render_progress_idle, progress_update);
   }
 
   g_byte_array_unref(source_snapshot);
 
   g_mutex_lock(&r->mutex);
   if (!r->render_pending || cancelled) {
-    guint source = r->render_pulse_source;
+    RenderOutcome outcome = cancelled ? RENDER_OUTCOME_CANCELLED : RENDER_OUTCOME_CANCELLED;
     g_mutex_unlock(&r->mutex);
-    if (source) g_source_remove(source);
     if (combined) g_byte_array_unref(combined);
-    g_printerr("[render] cancelled\n");
-    gtk_widget_hide(r->widgets.progress_bar);
+    completion = g_new0(RenderCompletion, 1);
+    completion->rec = r;
+    completion->generation = my_generation;
+    completion->outcome = outcome;
+    g_idle_add(render_completion_idle_cb, completion);
     return NULL;
   }
 
   guint64 rendered_frames = combined->len / (channels * sizeof(gint16));
   if (rendered_frames == 0) {
-    guint source = r->render_pulse_source;
-    r->render_pending = FALSE;
-    r->render_pulse_source = 0;
-    r->mode = MODE_IDLE;
     g_mutex_unlock(&r->mutex);
-    if (source) g_source_remove(source);
     g_byte_array_unref(combined);
-    gtk_widget_hide(r->widgets.progress_bar);
-    set_error(r, "Rubber Band produced no playback audio");
-    refresh_ui(r);
+    completion = g_new0(RenderCompletion, 1);
+    completion->rec = r;
+    completion->generation = my_generation;
+    completion->outcome = RENDER_OUTCOME_FAILED;
+    g_strlcpy(completion->error, "Rubber Band produced no playback audio", sizeof completion->error);
+    g_idle_add(render_completion_idle_cb, completion);
     return NULL;
   }
 
-  if (r->audio.playback_pcm) {
-    g_byte_array_unref(r->audio.playback_pcm);
-  }
-  r->audio.playback_pcm = combined;
-  r->audio.playback_rendered_to_source_ratio = (gdouble)source_frames / (gdouble)rendered_frames;
-  r->audio.playback_speed = speed;
-  r->audio.playback_valid = TRUE;
-
-  guint source = r->render_pulse_source;
-  r->render_pending = FALSE;
-  r->render_pulse_source = 0;
-  r->render_thread = NULL;
-
-  if (seek_pos >= 0.0) {
-    r->playback_cursor_frames = seek_pos;
-    r->display_playhead_frames = seek_pos;
-  }
-
-  if (source) g_source_remove(source);
-
-  if (should_play) {
-    r->mode = MODE_IDLE;
-    g_mutex_unlock(&r->mutex);
-    gtk_widget_hide(r->widgets.progress_bar);
-    if (!start_playback_thread(r)) {
-      set_error(r, "Failed to start playback after render");
-    }
-  } else {
-    r->mode = MODE_PAUSED;
-    g_mutex_unlock(&r->mutex);
-    gtk_widget_hide(r->widgets.progress_bar);
-    refresh_ui(r);
-  }
+  completion = g_new0(RenderCompletion, 1);
+  completion->rec = r;
+  completion->generation = my_generation;
+  completion->outcome = RENDER_OUTCOME_SUCCESS;
+  completion->playback_pcm = combined;
+  completion->source_frames = source_frames;
+  completion->rendered_frames = rendered_frames;
+  completion->speed = speed;
+  completion->seek_pos = seek_pos;
+  combined = NULL;
+  g_mutex_unlock(&r->mutex);
+  g_idle_add(render_completion_idle_cb, completion);
 
   return NULL;
 }
@@ -1037,9 +1125,9 @@ static gboolean ensure_playback_buffer(Recorder *r) {
   }
 
   r->render_source_mode = r->mode;
-  r->render_button_was_play = (r->mode != MODE_PLAYING);
   r->render_seek_pending = -1.0;
   r->render_pending = TRUE;
+  r->render_generation++;
   r->mode = MODE_RENDERING;
   g_mutex_unlock(&r->mutex);
 
@@ -1050,6 +1138,34 @@ static gboolean ensure_playback_buffer(Recorder *r) {
   r->render_thread = g_thread_new("rubberband-render", render_thread_main, r);
 
   refresh_ui(r);
+  return TRUE;
+}
+
+static gboolean start_playback_with_ready_buffer(Recorder *r) {
+  g_mutex_lock(&r->mutex);
+  if (r->playback_running) {
+    g_mutex_unlock(&r->mutex);
+    return TRUE;
+  }
+
+  if (!r->audio.playback_valid || !r->audio.playback_pcm || r->audio.playback_speed != r->speed) {
+    g_mutex_unlock(&r->mutex);
+    set_error(r, "Playback buffer is not ready");
+    return FALSE;
+  }
+
+  r->playback_stop_requested = FALSE;
+  r->playback_running = TRUE;
+  r->mode = MODE_PREPARING;
+  r->playback_anchor_frames = r->playback_cursor_frames;
+  r->playback_anchor_us = g_get_monotonic_time();
+  r->display_playhead_frames = r->playback_cursor_frames;
+  g_mutex_unlock(&r->mutex);
+
+  clear_error(r);
+
+  g_printerr("[ui] starting playback thread\n");
+  r->playback_thread = g_thread_new("pulse-playback", playback_thread_main, r);
   return TRUE;
 }
 
@@ -1721,38 +1837,14 @@ static gboolean start_playback_thread(Recorder *r) {
   g_mutex_unlock(&r->mutex);
 
   g_mutex_lock(&r->mutex);
-  r->render_auto_play = TRUE;
+  r->render_button_was_play = TRUE;
   g_mutex_unlock(&r->mutex);
 
   if (!ensure_playback_buffer(r)) {
     return FALSE;
   }
 
-  g_mutex_lock(&r->mutex);
-  if (r->playback_running) {
-    g_mutex_unlock(&r->mutex);
-    return TRUE;
-  }
-
-  AppMode start_mode = r->mode;
-  if (start_mode == MODE_RENDERING) {
-    g_mutex_unlock(&r->mutex);
-    return TRUE;
-  }
-
-  r->playback_stop_requested = FALSE;
-  r->playback_running = TRUE;
-  r->mode = MODE_PREPARING;
-  r->playback_anchor_frames = r->playback_cursor_frames;
-  r->playback_anchor_us = g_get_monotonic_time();
-  r->display_playhead_frames = r->playback_cursor_frames;
-  g_mutex_unlock(&r->mutex);
-
-  clear_error(r);
-
-  g_printerr("[ui] starting playback thread\n");
-  r->playback_thread = g_thread_new("pulse-playback", playback_thread_main, r);
-  return TRUE;
+  return start_playback_with_ready_buffer(r);
 }
 
 static void stop_playback_thread(Recorder *r, gboolean reset_cursor) {
@@ -1976,7 +2068,7 @@ static void transport_set_speed(Recorder *r, gdouble speed) {
 
   if (start_render) {
     g_mutex_lock(&r->mutex);
-    r->render_auto_play = FALSE;
+    r->render_button_was_play = FALSE;
     g_mutex_unlock(&r->mutex);
     if (!ensure_playback_buffer(r)) {
       set_error(r, "Failed to start render after speed change");
@@ -2455,7 +2547,6 @@ static void activate(GtkApplication *app, gpointer user_data) {
   r->render_pending = FALSE;
   r->render_source_mode = MODE_IDLE;
   r->render_button_was_play = TRUE;
-  r->render_auto_play = FALSE;
   r->render_seek_pending = -1.0;
   r->render_thread = NULL;
   r->render_pulse_source = 0;
