@@ -1,4 +1,7 @@
 spotify-recorder
+spotify-recorder.exe
+build/
+*.obj
 *.o
 *.wav
 third_party/rubberband/build/
