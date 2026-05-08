@@ -35,6 +35,7 @@ class RecorderController {
   void toggleLoop(bool enabled);
   void setLoopRegion(double start_frames, double end_frames, bool set);
   void setSpeed(double speed);
+  void setMode(RecorderMode mode);
   void seekFraction(double fraction);
   void tick(double elapsed_seconds = 0.0);
 
@@ -47,6 +48,7 @@ class RecorderController {
   RecorderMode mode() const;
   double capturedSeconds() const;
   void setCapturedFrames(double frames);
+  void setSampleRate(double sample_rate);
   double loopStartRatio() const;
   double loopEndRatio() const;
   bool loopRegionSet() const;

@@ -12,59 +12,11 @@
 #include <pulse/simple.h>
 
 #include "core.h"
+#include "linux_audio_backend.h"
 #include "platform.h"
 #include "platform_linux.h"
+#include "recorder_state.h"
 #include "third_party/rubberband/rubberband/rubberband-c.h"
-
-typedef struct {
-  GtkWidget *status_label;
-  GtkWidget *speed_value_label;
-  GtkWidget *time_label;
-  GtkWidget *waveform_base;
-  GtkWidget *record_button;
-  GtkWidget *play_pause_button;
-  GtkWidget *loop_button;
-  GtkWidget *stop_button;
-  GtkWidget *progress_bar;
-} AppWidgets;
-
-typedef struct {
-  AppWidgets widgets;
-  PlatformLinuxUiContext linux_ui;
-  PlatformAdapters platform;
-
-  GMutex mutex;
-  AudioBuffer audio;
-  gdouble speed;
-  gdouble playback_cursor_frames;
-  gdouble playback_anchor_frames;
-  gint64 playback_anchor_us;
-  gdouble display_playhead_frames;
-  LoopState loop;
-  gboolean scrubbing;
-  gboolean resume_after_scrub;
-
-  AppMode mode;
-  gboolean stop_requested;
-  gboolean capture_running;
-  GThread *capture_thread;
-  gboolean playback_running;
-  gboolean playback_stop_requested;
-  GThread *playback_thread;
-  pa_threaded_mainloop *playback_ml;
-  guint tick_callback_id;
-  gint last_playhead_x;
-  char last_error[256];
-  gboolean render_pending;
-  AppMode render_source_mode;
-  RenderIntent render_intent;
-  GThread *render_thread;
-  guint render_pulse_source;
-  guint render_generation;
-  gint64 render_started_us;
-  gdouble render_estimated_total_us;
-  gulong loop_toggled_handler_id;
-} Recorder;
 
 typedef struct {
   Recorder *rec;
@@ -97,20 +49,21 @@ static void clear_error(Recorder *r) {
 
 static void update_button_sensitivity(Recorder *r) {
   CoreUiState ui_state;
+  void *ui_user_data = r->platform.backend.user_data;
 
   g_mutex_lock(&r->mutex);
   ui_state = core_build_ui_state(r->mode, r->render_intent.should_play);
   g_mutex_unlock(&r->mutex);
 
   if (r->platform.ui && r->platform.ui->set_controls_sensitive) {
-    r->platform.ui->set_controls_sensitive(r->platform.backend.user_data,
-                                           ui_state.record_enabled,
-                                           ui_state.play_pause_enabled,
-                                           ui_state.loop_enabled,
-                                           ui_state.stop_enabled);
+    r->platform.ui->set_controls_sensitive(ui_user_data,
+                                            ui_state.record_enabled,
+                                            ui_state.play_pause_enabled,
+                                            ui_state.loop_enabled,
+                                            ui_state.stop_enabled);
   }
   if (r->platform.ui && r->platform.ui->set_play_pause_label) {
-    r->platform.ui->set_play_pause_label(r->platform.backend.user_data, ui_state.play_pause_label);
+    r->platform.ui->set_play_pause_label(ui_user_data, ui_state.play_pause_label);
   }
 }
 
@@ -121,33 +74,10 @@ static void set_mode(Recorder *r, AppMode mode) {
 }
 
 static void invalidate_playback_buffer_locked(Recorder *r);
-static gboolean start_capture_thread(Recorder *r, gboolean reset_buffers);
-static void stop_capture_thread(Recorder *r, gboolean force_stopped);
-static gboolean start_playback_thread(Recorder *r);
-static void stop_playback_thread(Recorder *r, gboolean reset_cursor);
-
-static gboolean linux_audio_start_capture(void *user_data, gboolean reset_buffers) {
-  return start_capture_thread((Recorder *)user_data, reset_buffers);
-}
-
-static void linux_audio_stop_capture(void *user_data, gboolean force_stopped) {
-  stop_capture_thread((Recorder *)user_data, force_stopped);
-}
-
-static gboolean linux_audio_start_playback(void *user_data) {
-  return start_playback_thread((Recorder *)user_data);
-}
-
-static void linux_audio_stop_playback(void *user_data, gboolean reset_cursor) {
-  stop_playback_thread((Recorder *)user_data, reset_cursor);
-}
-
-static const PlatformAudioVTable linux_audio_vtable = {
-  .start_capture = linux_audio_start_capture,
-  .stop_capture = linux_audio_stop_capture,
-  .start_playback = linux_audio_start_playback,
-  .stop_playback = linux_audio_stop_playback,
-};
+gboolean start_capture_thread(Recorder *r, gboolean reset_buffers);
+void stop_capture_thread(Recorder *r, gboolean force_stopped);
+gboolean start_playback_thread(Recorder *r);
+void stop_playback_thread(Recorder *r, gboolean reset_cursor);
 
 static GThread *cancel_render_locked(Recorder *r, AppMode next_mode) {
   GThread *render_thread = NULL;
@@ -182,10 +112,8 @@ static gdouble get_idle_resume_cursor_locked(Recorder *r) {
 }
 
 static double get_playhead_ratio(Recorder *r);
-static gboolean start_playback_thread(Recorder *r);
 static gboolean start_playback_with_ready_buffer(Recorder *r);
 static gpointer playback_thread_main(gpointer user_data);
-static void stop_playback_thread(Recorder *r, gboolean reset_cursor);
 static void on_loop_toggled(GtkToggleButton *button, gpointer user_data);
 
 static void update_display_playhead(Recorder *r) {
@@ -318,9 +246,9 @@ static void seek_to_fraction(Recorder *r, double fraction) {
 
   if (mode == MODE_PLAYING && !scrubbing) {
     if (r->platform.audio && r->platform.audio->stop_playback) {
-      r->platform.audio->stop_playback(r->platform.backend.user_data, FALSE);
+      r->platform.audio->stop_playback(r->platform.backend.audio_user_data, FALSE);
     }
-    if (!r->platform.audio || !r->platform.audio->start_playback || !r->platform.audio->start_playback(r->platform.backend.user_data)) {
+    if (!r->platform.audio || !r->platform.audio->start_playback || !r->platform.audio->start_playback(r->platform.backend.audio_user_data)) {
       return;
     }
   } else {
@@ -344,7 +272,7 @@ static void begin_scrub(Recorder *r) {
 
   g_printerr("[scrub] begin resume=%d\n", was_playing ? 1 : 0);
   if (was_playing && r->platform.audio && r->platform.audio->stop_playback) {
-    r->platform.audio->stop_playback(r->platform.backend.user_data, FALSE);
+    r->platform.audio->stop_playback(r->platform.backend.audio_user_data, FALSE);
   }
 }
 
@@ -395,7 +323,7 @@ static void end_scrub(Recorder *r) {
   g_printerr("[scrub] end resume=%d\n", resume ? 1 : 0);
   if (resume) {
     if (r->platform.audio && r->platform.audio->start_playback) {
-      r->platform.audio->start_playback(r->platform.backend.user_data);
+      r->platform.audio->start_playback(r->platform.backend.audio_user_data);
     }
   }
 }
@@ -661,8 +589,6 @@ cleanup:
 static void invalidate_playback_buffer_locked(Recorder *r) {
   r->audio.playback_valid = FALSE;
 }
-
-static gboolean start_playback_thread(Recorder *r);
 
 static gboolean render_progress_tick_cb(gpointer data) {
   RenderProgressTick *tick = data;
@@ -977,7 +903,7 @@ static gboolean start_playback_with_ready_buffer(Recorder *r) {
 
   g_printerr("[ui] starting playback thread\n");
   if (r->platform.audio && r->platform.audio->start_playback) {
-    return r->platform.audio->start_playback(r->platform.backend.user_data);
+    return r->platform.audio->start_playback(r->platform.backend.audio_user_data);
   }
 
   r->playback_thread = g_thread_new("pulse-playback", playback_thread_main, r);
@@ -1606,7 +1532,7 @@ cleanup:
   return NULL;
 }
 
-static gboolean start_capture_thread(Recorder *r, gboolean reset_buffers) {
+gboolean start_capture_thread(Recorder *r, gboolean reset_buffers) {
   g_mutex_lock(&r->mutex);
   if (r->capture_running) {
     g_mutex_unlock(&r->mutex);
@@ -1630,7 +1556,7 @@ static gboolean start_capture_thread(Recorder *r, gboolean reset_buffers) {
   return TRUE;
 }
 
-static gboolean start_playback_thread(Recorder *r) {
+gboolean start_playback_thread(Recorder *r) {
   g_mutex_lock(&r->mutex);
   if (r->playback_running) {
     g_mutex_unlock(&r->mutex);
@@ -1662,7 +1588,7 @@ static gboolean start_playback_thread(Recorder *r) {
   return start_playback_with_ready_buffer(r);
 }
 
-static void stop_playback_thread(Recorder *r, gboolean reset_cursor) {
+void stop_playback_thread(Recorder *r, gboolean reset_cursor) {
   GThread *thread = NULL;
   gdouble preserved_display_frames = 0.0;
   gboolean preserve_display = !reset_cursor;
@@ -1704,7 +1630,7 @@ static void stop_playback_thread(Recorder *r, gboolean reset_cursor) {
   g_mutex_unlock(&r->mutex);
 }
 
-static void stop_capture_thread(Recorder *r, gboolean force_stopped) {
+void stop_capture_thread(Recorder *r, gboolean force_stopped) {
   GThread *thread = NULL;
 
   g_mutex_lock(&r->mutex);
@@ -1743,12 +1669,12 @@ static void transport_stop(Recorder *r, const CoreTransportPlan *plan) {
   } else {
     if (plan->should_stop_playback) {
       if (r->platform.audio && r->platform.audio->stop_playback) {
-        r->platform.audio->stop_playback(r->platform.backend.user_data, !plan->preserve_cursor);
+        r->platform.audio->stop_playback(r->platform.backend.audio_user_data, !plan->preserve_cursor);
       }
     }
     if (plan->should_stop_capture) {
       if (r->platform.audio && r->platform.audio->stop_capture) {
-        r->platform.audio->stop_capture(r->platform.backend.user_data, FALSE);
+        r->platform.audio->stop_capture(r->platform.backend.audio_user_data, FALSE);
       }
     }
     set_mode(r, plan->next_mode);
@@ -1776,10 +1702,10 @@ static void transport_start_recording(Recorder *r, const CoreTransportPlan *plan
     g_printerr("[ui] record clicked: starting\n");
     if (plan->should_stop_playback) {
       if (r->platform.audio && r->platform.audio->stop_playback) {
-        r->platform.audio->stop_playback(r->platform.backend.user_data, TRUE);
+        r->platform.audio->stop_playback(r->platform.backend.audio_user_data, TRUE);
       }
     }
-    if (!r->platform.audio || !r->platform.audio->start_capture || !r->platform.audio->start_capture(r->platform.backend.user_data, plan->reset_buffers)) {
+    if (!r->platform.audio || !r->platform.audio->start_capture || !r->platform.audio->start_capture(r->platform.backend.audio_user_data, plan->reset_buffers)) {
       set_error(r, "Failed to start capture thread");
     }
     set_mode(r, plan->next_mode);
@@ -1796,7 +1722,7 @@ static gboolean transport_play_from_idle(Recorder *r) {
   g_mutex_unlock(&r->mutex);
 
   if (r->platform.audio && r->platform.audio->stop_capture) {
-    r->platform.audio->stop_capture(r->platform.backend.user_data, FALSE);
+    r->platform.audio->stop_capture(r->platform.backend.audio_user_data, FALSE);
   }
 
   g_mutex_lock(&r->mutex);
@@ -1807,7 +1733,7 @@ static gboolean transport_play_from_idle(Recorder *r) {
                                  &r->display_playhead_frames);
   g_mutex_unlock(&r->mutex);
   return r->platform.audio && r->platform.audio->start_playback
-    ? r->platform.audio->start_playback(r->platform.backend.user_data)
+    ? r->platform.audio->start_playback(r->platform.backend.audio_user_data)
     : start_playback_thread(r);
 }
 
@@ -1826,7 +1752,7 @@ static void transport_pause(Recorder *r) {
   g_mutex_unlock(&r->mutex);
 
   if (r->platform.audio && r->platform.audio->stop_playback) {
-    r->platform.audio->stop_playback(r->platform.backend.user_data, FALSE);
+    r->platform.audio->stop_playback(r->platform.backend.audio_user_data, FALSE);
   }
 }
 
@@ -1843,7 +1769,7 @@ static void transport_resume(Recorder *r) {
   g_printerr("[ui] playback resumed\n");
   g_mutex_unlock(&r->mutex);
 
-  if (!r->platform.audio || !r->platform.audio->start_playback || !r->platform.audio->start_playback(r->platform.backend.user_data)) {
+  if (!r->platform.audio || !r->platform.audio->start_playback || !r->platform.audio->start_playback(r->platform.backend.audio_user_data)) {
     set_error(r, "Failed to resume playback");
   }
 }
@@ -1892,9 +1818,9 @@ static void transport_set_speed(Recorder *r, gdouble speed) {
 
   if (restart_playback) {
     if (r->platform.audio && r->platform.audio->stop_playback) {
-      r->platform.audio->stop_playback(r->platform.backend.user_data, FALSE);
+      r->platform.audio->stop_playback(r->platform.backend.audio_user_data, FALSE);
     }
-    if (!r->platform.audio || !r->platform.audio->start_playback || !r->platform.audio->start_playback(r->platform.backend.user_data)) {
+    if (!r->platform.audio || !r->platform.audio->start_playback || !r->platform.audio->start_playback(r->platform.backend.audio_user_data)) {
       set_error(r, "Failed to restart playback at new speed");
       refresh_ui(r);
     }
@@ -2255,10 +2181,10 @@ static void on_window_destroy(GtkWidget *widget, gpointer user_data) {
   }
 
   if (r->platform.audio && r->platform.audio->stop_playback) {
-    r->platform.audio->stop_playback(r->platform.backend.user_data, TRUE);
+    r->platform.audio->stop_playback(r->platform.backend.audio_user_data, TRUE);
   }
   if (r->platform.audio && r->platform.audio->stop_capture) {
-    r->platform.audio->stop_capture(r->platform.backend.user_data, TRUE);
+    r->platform.audio->stop_capture(r->platform.backend.audio_user_data, TRUE);
   }
 
   g_mutex_clear(&r->mutex);
@@ -2317,7 +2243,8 @@ static void activate(GtkApplication *app, gpointer user_data) {
   r->linux_ui.stop_button = stop_button;
   r->linux_ui.progress_bar = progress_bar;
   r->platform = platform_linux_build(&r->linux_ui);
-  r->platform.audio = &linux_audio_vtable;
+  r->platform.backend.audio_user_data = r;
+  r->platform.audio = linux_audio_backend_vtable();
   r->audio.sample_rate = 44100;
   r->audio.channels = 2;
   r->audio.pcm = g_byte_array_new();

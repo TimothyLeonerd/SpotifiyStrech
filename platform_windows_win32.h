@@ -5,6 +5,10 @@
 
 #ifdef _WIN32
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef struct PlatformWindowsHost {
   PlatformWindowsContext *context;
   HINSTANCE instance;
@@ -17,6 +21,10 @@ int platform_windows_host_run(PlatformWindowsHost *host);
 void platform_windows_host_shutdown(PlatformWindowsHost *host);
 LRESULT platform_windows_host_message(PlatformWindowsHost *host, HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam);
 void platform_windows_host_invalidate_waveform(PlatformWindowsHost *host);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif
 

@@ -5,6 +5,12 @@
 
 #include "recorder_controller.h"
 
+#ifdef _WIN32
+#include "platform_windows.h"
+#include "windows_audio_backend.h"
+#include "windows_debug_log.h"
+#endif
+
 class QPaintEvent;
 
 class QLabel;
@@ -18,6 +24,7 @@ class WaveformWidget : public QWidget {
   explicit WaveformWidget(QWidget *parent = nullptr);
 
   void setPeaks(const QVector<int> &peaks);
+  void setEnvelopeMode(bool enabled);
   void setPlayheadRatio(double ratio);
   void setLoopRegion(double start_ratio, double end_ratio, bool enabled);
 
@@ -26,6 +33,7 @@ class WaveformWidget : public QWidget {
 
  private:
   QVector<int> peaks_;
+  bool envelope_mode_ = false;
   double playhead_ratio_ = 0.0;
   double loop_start_ratio_ = 0.0;
   double loop_end_ratio_ = 1.0;
@@ -38,6 +46,7 @@ class RecorderWindow : public QMainWindow {
 
  private:
   void refreshWaveform();
+  void refreshFromWindowsBackend();
   void updateSpeedLabel();
   void updatePlayPauseLabel();
   void syncFromController();
@@ -56,4 +65,8 @@ class RecorderWindow : public QMainWindow {
   QProgressBar *progress_bar_ = nullptr;
   WaveformWidget *waveform_ = nullptr;
   RecorderController controller_;
+
+#ifdef _WIN32
+  PlatformWindowsContext windows_audio_context_{};
+#endif
 };

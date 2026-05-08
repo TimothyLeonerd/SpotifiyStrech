@@ -12,6 +12,9 @@
 #include <QTimer>
 
 #include <algorithm>
+#include <cstdint>
+#include <cmath>
+#include <string>
 #include <vector>
 
 WaveformWidget::WaveformWidget(QWidget *parent) : QWidget(parent) {
@@ -22,6 +25,11 @@ WaveformWidget::WaveformWidget(QWidget *parent) : QWidget(parent) {
 
 void WaveformWidget::setPeaks(const QVector<int> &peaks) {
   peaks_ = peaks;
+  update();
+}
+
+void WaveformWidget::setEnvelopeMode(bool enabled) {
+  envelope_mode_ = enabled;
   update();
 }
 
@@ -72,14 +80,34 @@ void WaveformWidget::paintEvent(QPaintEvent *event) {
 
   const int mid_y = r.center().y();
   const int count = peaks_.size();
-  painter.setPen(QPen(QColor(78, 199, 132), 2));
+  painter.setPen(QPen(QColor(78, 199, 132), 1));
 
-  for (int x = 0; x < r.width(); ++x) {
-    int idx = (x * count) / qMax(1, r.width());
-    if (idx >= count) idx = count - 1;
-    const double amp = peaks_.at(idx) / 100.0;
-    const int half = static_cast<int>((r.height() * 0.42) * amp);
-    painter.drawLine(x, mid_y - half, x, mid_y + half);
+  if (envelope_mode_ && count >= 2) {
+    const int pair_count = count / 2;
+    for (int i = 0; i < pair_count; ++i) {
+      const double ratio = (pair_count > 1) ? static_cast<double>(i) / static_cast<double>(pair_count - 1) : 0.0;
+      const double min_amp = std::clamp(peaks_.at(i * 2) / 100.0, -1.0, 1.0);
+      const double max_amp = std::clamp(peaks_.at(i * 2 + 1) / 100.0, -1.0, 1.0);
+      const int x = static_cast<int>(ratio * (r.width() - 1));
+      const int y1 = mid_y - static_cast<int>((r.height() * 0.42) * max_amp);
+      const int y2 = mid_y - static_cast<int>((r.height() * 0.42) * min_amp);
+      painter.drawLine(x, y1, x, y2);
+    }
+  } else {
+    const bool signed_mode = std::any_of(peaks_.cbegin(), peaks_.cend(), [](int value) { return value < 0; });
+    QPointF prev_point;
+    for (int i = 0; i < count; ++i) {
+      const double ratio = (count > 1) ? static_cast<double>(i) / static_cast<double>(count - 1) : 0.0;
+      const double amp = std::clamp(peaks_.at(i) / 100.0, -1.0, 1.0);
+      const double x = ratio * (r.width() - 1);
+      const double y = signed_mode ? (mid_y - ((r.height() * 0.42) * amp))
+                                   : (mid_y - ((r.height() * 0.42) * std::fabs(amp)));
+      const QPointF point(x, y);
+      if (i > 0) {
+        painter.drawLine(prev_point, point);
+      }
+      prev_point = point;
+    }
   }
 
   painter.fillRect(QRectF(0, 0, playhead_ratio_ * r.width(), r.height()), QColor(255, 140, 0, 36));
@@ -90,6 +118,12 @@ void WaveformWidget::paintEvent(QPaintEvent *event) {
 RecorderWindow::RecorderWindow(QWidget *parent) : QMainWindow(parent) {
   setWindowTitle(QStringLiteral("Spotify Audio Recorder"));
   resize(1100, 720);
+
+#ifdef _WIN32
+  windows_audio_context_.adapters.backend.user_data = &windows_audio_context_;
+  windows_audio_context_.adapters.backend.audio_user_data = &windows_audio_context_;
+  windows_audio_context_.adapters.audio = windows_audio_backend_vtable();
+#endif
 
   central_ = new QWidget(this);
   auto *root = new QVBoxLayout(central_);
@@ -167,17 +201,64 @@ RecorderWindow::RecorderWindow(QWidget *parent) : QMainWindow(parent) {
   setStyleSheet(dark_css);
 
   connect(record_button_, &QPushButton::clicked, this, [this]() {
+#ifdef _WIN32
+    windows_debug_log("qt record clicked");
+    bool started = false;
+    if (windows_audio_context_.adapters.audio && windows_audio_context_.adapters.audio->start_capture) {
+      windows_debug_log("qt starting capture backend");
+      started = windows_audio_context_.adapters.audio->start_capture(windows_audio_context_.adapters.backend.audio_user_data, TRUE) != 0;
+    }
+    windows_debug_log(started ? "qt capture backend started" : "qt capture backend failed");
+    if (started) {
+      controller_.record();
+    } else {
+      controller_.stop();
+    }
+#else
     controller_.record();
+#endif
+    windows_debug_log("qt sync after record");
     syncFromController();
+    windows_debug_log("qt record sync complete");
   });
 
   connect(stop_button_, &QPushButton::clicked, this, [this]() {
+#ifdef _WIN32
+    if (windows_audio_context_.adapters.audio) {
+      if (windows_audio_context_.adapters.audio->stop_playback) {
+        windows_audio_context_.adapters.audio->stop_playback(windows_audio_context_.adapters.backend.audio_user_data, TRUE);
+      }
+      if (windows_audio_context_.adapters.audio->stop_capture) {
+        windows_audio_context_.adapters.audio->stop_capture(windows_audio_context_.adapters.backend.audio_user_data, TRUE);
+      }
+    }
+#endif
     controller_.stop();
     syncFromController();
   });
 
   connect(play_pause_button_, &QPushButton::clicked, this, [this]() {
+#ifdef _WIN32
+    bool started = false;
+    if (windows_audio_context_.adapters.audio) {
+      const bool playback_active = windows_audio_backend_has_playback(windows_audio_context_.adapters.backend.audio_user_data) != 0;
+      if (playback_active) {
+        if (windows_audio_context_.adapters.audio->stop_playback) {
+          windows_audio_context_.adapters.audio->stop_playback(windows_audio_context_.adapters.backend.audio_user_data, FALSE);
+        }
+        controller_.stop();
+      } else if (windows_audio_context_.adapters.audio->start_playback) {
+        started = windows_audio_context_.adapters.audio->start_playback(windows_audio_context_.adapters.backend.audio_user_data) != 0;
+        if (started) {
+          controller_.playPause();
+        } else {
+          controller_.stop();
+        }
+      }
+    }
+#else
     controller_.playPause();
+#endif
     syncFromController();
   });
 
@@ -200,20 +281,159 @@ RecorderWindow::RecorderWindow(QWidget *parent) : QMainWindow(parent) {
   });
   ticker->start();
 
+#ifdef _WIN32
+  auto *backend_timer = new QTimer(this);
+  backend_timer->setInterval(100);
+  connect(backend_timer, &QTimer::timeout, this, [this]() {
+    refreshFromWindowsBackend();
+  });
+  backend_timer->start();
+#endif
+
   controller_.setCapturedFrames(0.0);
   setDefaultLoopRegion();
   syncFromController();
 }
 
 void RecorderWindow::refreshWaveform() {
+#ifdef _WIN32
+  unsigned char *pcm = nullptr;
+  size_t pcm_len = 0;
+  void *format_ptr = nullptr;
+  int capture_active = 0;
+  int playback_active = 0;
+
+  if (windows_audio_backend_snapshot(&windows_audio_context_,
+                                     &pcm,
+                                     &pcm_len,
+                                     &format_ptr,
+                                     &capture_active,
+                                     &playback_active)) {
+    const auto *format = static_cast<WAVEFORMATEX *>(format_ptr);
+    QVector<int> qt_peaks;
+    qt_peaks.reserve(480);
+    const int channels = (format && format->nChannels > 0) ? format->nChannels : 2;
+    const int bytes_per_sample = (format && format->nChannels > 0 && format->nBlockAlign > 0)
+                                   ? static_cast<int>(format->nBlockAlign / format->nChannels)
+                                   : ((format && format->wBitsPerSample == 32) ? 4 : 2);
+    const size_t frame_bytes = static_cast<size_t>(channels * bytes_per_sample);
+    const double bytes_per_sec = (format && format->nAvgBytesPerSec > 0) ? static_cast<double>(format->nAvgBytesPerSec) : 0.0;
+    const double sample_rate = (format && format->nSamplesPerSec > 0)
+                                 ? static_cast<double>(format->nSamplesPerSec)
+                                 : 44100.0;
+    const double captured_seconds = bytes_per_sec > 0.0 ? static_cast<double>(pcm_len) / bytes_per_sec : 0.0;
+    const RecorderMode backend_mode = capture_active ? RecorderMode::Recording
+                                                     : (playback_active ? RecorderMode::Playing : RecorderMode::Idle);
+
+    controller_.setSampleRate(sample_rate);
+    controller_.setCapturedFrames(captured_seconds * sample_rate);
+    controller_.setMode(backend_mode);
+    if (!capture_active && !playback_active) {
+      controller_.seekFraction(0.0);
+    }
+
+    if (pcm && pcm_len > 0 && frame_bytes > 0) {
+      const bool is_float = windows_audio_backend_format_is_float(format_ptr) != 0;
+      const int target_points = std::max(2, waveform_->width());
+      const size_t frame_count = pcm_len / frame_bytes;
+      const size_t points = static_cast<size_t>(std::min<int>(target_points, static_cast<int>(std::max<size_t>(2, frame_count))));
+      qt_peaks.reserve(static_cast<int>(points) * 2);
+
+      for (size_t i = 0; i < points; ++i) {
+        const size_t start_frame = (i * frame_count) / points;
+        const size_t end_frame = ((i + 1) * frame_count) / points;
+        double min_amp = 1.0;
+        double max_amp = -1.0;
+        bool have_sample = false;
+
+        for (size_t frame_index = start_frame; frame_index < end_frame && frame_index < frame_count; ++frame_index) {
+          const size_t pos = frame_index * frame_bytes;
+          if (is_float && bytes_per_sample == 4) {
+            const auto *frame = reinterpret_cast<const float *>(pcm + pos);
+            for (int c = 0; c < channels; ++c) {
+              const double sample = frame[c];
+              min_amp = std::min(min_amp, sample);
+              max_amp = std::max(max_amp, sample);
+              have_sample = true;
+            }
+          } else if (bytes_per_sample == 4) {
+            const auto *frame = reinterpret_cast<const int32_t *>(pcm + pos);
+            for (int c = 0; c < channels; ++c) {
+              const double sample = static_cast<double>(frame[c]) / 2147483648.0;
+              min_amp = std::min(min_amp, sample);
+              max_amp = std::max(max_amp, sample);
+              have_sample = true;
+            }
+          } else if (bytes_per_sample == 3) {
+            const unsigned char *frame = pcm + pos;
+            for (int c = 0; c < channels; ++c) {
+              const size_t offset = static_cast<size_t>(c) * 3;
+              int32_t sample = (static_cast<int32_t>(frame[offset + 2]) << 16) |
+                               (static_cast<int32_t>(frame[offset + 1]) << 8) |
+                               static_cast<int32_t>(frame[offset]);
+              if (sample & 0x00800000) sample |= ~0x00FFFFFF;
+              const double value = static_cast<double>(sample) / 8388608.0;
+              min_amp = std::min(min_amp, value);
+              max_amp = std::max(max_amp, value);
+              have_sample = true;
+            }
+          } else if (bytes_per_sample == 2) {
+            const auto *frame = reinterpret_cast<const int16_t *>(pcm + pos);
+            for (int c = 0; c < channels; ++c) {
+              const double sample = static_cast<double>(frame[c]) / 32768.0;
+              min_amp = std::min(min_amp, sample);
+              max_amp = std::max(max_amp, sample);
+              have_sample = true;
+            }
+          } else {
+            const auto *frame = reinterpret_cast<const uint8_t *>(pcm + pos);
+            for (int c = 0; c < channels; ++c) {
+              const double sample = (static_cast<double>(frame[c]) - 128.0) / 128.0;
+              min_amp = std::min(min_amp, sample);
+              max_amp = std::max(max_amp, sample);
+              have_sample = true;
+            }
+          }
+        }
+
+        if (!have_sample) {
+          min_amp = 0.0;
+          max_amp = 0.0;
+        }
+        qt_peaks.push_back(static_cast<int>(std::clamp(min_amp, -1.0, 1.0) * 100.0));
+        qt_peaks.push_back(static_cast<int>(std::clamp(max_amp, -1.0, 1.0) * 100.0));
+      }
+
+      windows_debug_log((std::string("waveform stats buckets=") + std::to_string(points) +
+                         " frames=" + std::to_string(frame_count)).c_str());
+    }
+
+    waveform_->setEnvelopeMode(true);
+    waveform_->setPeaks(qt_peaks);
+    waveform_->setPlayheadRatio(controller_.playheadRatio());
+    waveform_->update();
+  }
+
+  free(pcm);
+  free(format_ptr);
+  return;
+#endif
   const std::vector<int> peaks = controller_.waveformPeaks();
   QVector<int> qt_peaks;
   qt_peaks.reserve(static_cast<int>(peaks.size()));
   for (int peak : peaks) {
     qt_peaks.push_back(peak);
   }
+  waveform_->setEnvelopeMode(false);
   waveform_->setPeaks(qt_peaks);
   waveform_->update();
+}
+
+void RecorderWindow::refreshFromWindowsBackend() {
+#ifdef _WIN32
+  refreshWaveform();
+  syncFromController();
+#endif
 }
 
 void RecorderWindow::updateSpeedLabel() {
@@ -248,5 +468,7 @@ void RecorderWindow::syncFromController() {
   loop_button_->setChecked(controller_.loopEnabled());
   waveform_->setLoopRegion(controller_.loopStartRatio(), controller_.loopEndRatio(), controller_.loopEnabled());
   waveform_->setPlayheadRatio(controller_.playheadRatio());
+#ifndef _WIN32
   refreshWaveform();
+#endif
 }

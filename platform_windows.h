@@ -4,7 +4,14 @@
 #include "platform.h"
 
 #ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
+#endif
+
+#ifdef __cplusplus
+extern "C" {
 #endif
 
 typedef void (*PlatformWindowsCommandHandler)(void *user_data, int command_id);
@@ -15,6 +22,7 @@ typedef struct PlatformWindowsContext {
   HINSTANCE instance;
   HWND window;
   ATOM window_class;
+  void *audio_state;
   HWND status_label;
   HWND speed_value_label;
   HWND time_label;
@@ -30,5 +38,9 @@ typedef struct PlatformWindowsContext {
 } PlatformWindowsContext;
 
 PlatformAdapters platform_windows_build(PlatformWindowsContext *context);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

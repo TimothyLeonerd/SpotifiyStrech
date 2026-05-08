@@ -82,6 +82,10 @@ void RecorderController::setSpeed(double speed) {
   speed_ = speed;
 }
 
+void RecorderController::setMode(RecorderMode mode) {
+  mode_ = mode;
+}
+
 void RecorderController::seekFraction(double fraction) {
   if (fraction < 0.0) fraction = 0.0;
   if (fraction > 1.0) fraction = 1.0;
@@ -157,6 +161,12 @@ double RecorderController::capturedSeconds() const {
 void RecorderController::setCapturedFrames(double frames) {
   if (frames < 0.0) frames = 0.0;
   captured_frames_ = frames;
+}
+
+void RecorderController::setSampleRate(double sample_rate) {
+  if (sample_rate > 0.0) {
+    sample_rate_ = sample_rate;
+  }
 }
 
 double RecorderController::loopStartRatio() const {

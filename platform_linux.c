@@ -240,6 +240,7 @@ PlatformAdapters platform_linux_build(PlatformLinuxUiContext *ui) {
   adapters.backend.kind = PLATFORM_KIND_LINUX;
   adapters.backend.name = "linux-gtk3-pulseaudio";
   adapters.backend.user_data = ui;
+  adapters.backend.audio_user_data = NULL;
   adapters.ui = &linux_ui_vtable;
   return adapters;
 }

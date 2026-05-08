@@ -21,6 +21,8 @@ typedef struct _GtkWidget GtkWidget;
 typedef struct _GdkEventButton GdkEventButton;
 typedef struct _cairo cairo_t;
 
+#include "audio_backend.h"
+
 typedef struct {
   gboolean enabled;
   gboolean explicit_region_set;
@@ -39,14 +41,10 @@ typedef struct {
   PlatformKind kind;
   const char *name;
   void *user_data;
+  void *audio_user_data;
 } PlatformBackend;
 
-typedef struct {
-  gboolean (*start_capture)(void *user_data, gboolean reset_buffers);
-  void (*stop_capture)(void *user_data, gboolean force_stopped);
-  gboolean (*start_playback)(void *user_data);
-  void (*stop_playback)(void *user_data, gboolean reset_cursor);
-} PlatformAudioVTable;
+typedef AudioBackendVTable PlatformAudioVTable;
 
 typedef struct {
   void (*set_status_text)(void *user_data, const char *text);
