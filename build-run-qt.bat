@@ -18,7 +18,7 @@ if not exist "%BUILD_DIR%\CMakeCache.txt" (
   if errorlevel 1 exit /b %errorlevel%
 )
 
-cmake --build "%BUILD_DIR%" --config Release
+cmake --build "%BUILD_DIR%" --config Release --verbose
 if errorlevel 1 exit /b %errorlevel%
 
 "%QT_DIR%\bin\windeployqt.exe" "%EXE%"

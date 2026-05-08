@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <vector>
 #include <string>
 
 enum class RecorderMode {
@@ -49,6 +50,7 @@ class RecorderController {
   double loopStartRatio() const;
   double loopEndRatio() const;
   bool loopRegionSet() const;
+  std::vector<int> waveformPeaks() const;
 
  private:
   static const char *modeText(RecorderMode mode);

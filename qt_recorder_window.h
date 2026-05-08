@@ -37,7 +37,6 @@ class RecorderWindow : public QMainWindow {
   explicit RecorderWindow(QWidget *parent = nullptr);
 
  private:
-  QVector<int> buildDemoPeaks() const;
   void refreshWaveform();
   void updateSpeedLabel();
   void updatePlayPauseLabel();

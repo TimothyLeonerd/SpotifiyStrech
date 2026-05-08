@@ -11,8 +11,8 @@
 #include <QSlider>
 #include <QTimer>
 
-#include <cmath>
 #include <algorithm>
+#include <vector>
 
 WaveformWidget::WaveformWidget(QWidget *parent) : QWidget(parent) {
   setMinimumHeight(280);
@@ -137,7 +137,6 @@ RecorderWindow::RecorderWindow(QWidget *parent) : QMainWindow(parent) {
   speed_row->addWidget(speed_value_label_);
 
   waveform_ = new WaveformWidget(central_);
-  waveform_->setPeaks(buildDemoPeaks());
   setDefaultLoopRegion();
 
   time_label_ = new QLabel(QStringLiteral("0.0 / 0.0s"), central_);
@@ -206,19 +205,14 @@ RecorderWindow::RecorderWindow(QWidget *parent) : QMainWindow(parent) {
   syncFromController();
 }
 
-QVector<int> RecorderWindow::buildDemoPeaks() const {
-  QVector<int> peaks;
-  peaks.reserve(480);
-  for (int i = 0; i < 480; ++i) {
-    const double x = static_cast<double>(i) / 480.0;
-    const double base = std::sin(x * 18.0) * 0.42 + std::sin(x * 57.0) * 0.18 + 0.5;
-    const double shaped = std::max(0.06, std::min(1.0, base));
-    peaks.push_back(static_cast<int>(shaped * 100.0));
-  }
-  return peaks;
-}
-
 void RecorderWindow::refreshWaveform() {
+  const std::vector<int> peaks = controller_.waveformPeaks();
+  QVector<int> qt_peaks;
+  qt_peaks.reserve(static_cast<int>(peaks.size()));
+  for (int peak : peaks) {
+    qt_peaks.push_back(peak);
+  }
+  waveform_->setPeaks(qt_peaks);
   waveform_->update();
 }
 
@@ -254,5 +248,5 @@ void RecorderWindow::syncFromController() {
   loop_button_->setChecked(controller_.loopEnabled());
   waveform_->setLoopRegion(controller_.loopStartRatio(), controller_.loopEndRatio(), controller_.loopEnabled());
   waveform_->setPlayheadRatio(controller_.playheadRatio());
-  waveform_->update();
+  refreshWaveform();
 }

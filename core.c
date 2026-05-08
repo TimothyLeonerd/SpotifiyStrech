@@ -135,6 +135,26 @@ CoreTransportPlan core_transport_stop_plan(AppMode mode, gboolean render_pending
   return plan;
 }
 
+CoreTransportDecision core_transport_decision(AppMode mode, gboolean render_pending, gboolean capture_running, TransportAction action) {
+  CoreTransportDecision decision = {0};
+
+  switch (action) {
+    case TRANSPORT_ACTION_RECORD:
+      decision.plan = core_transport_record_plan(mode, render_pending, capture_running);
+      break;
+    case TRANSPORT_ACTION_STOP:
+      decision.plan = core_transport_stop_plan(mode, render_pending);
+      break;
+    case TRANSPORT_ACTION_PLAY_PAUSE:
+      decision.play_pause_action = core_transport_play_pause_action(mode);
+      break;
+    default:
+      break;
+  }
+
+  return decision;
+}
+
 static gdouble clamp_loop_frame(gdouble frame, gdouble total_frames) {
   if (frame < 0.0) {
     return 0.0;
@@ -180,6 +200,90 @@ LoopSnapshot core_get_loop_snapshot(const LoopState *loop, gdouble total_frames)
   snapshot.total_frames = total_frames;
   snapshot.effective_region_set = core_get_effective_loop_region(loop, total_frames, &snapshot.start_frames, &snapshot.end_frames);
   return snapshot;
+}
+
+gboolean core_compute_loop_drag_region(LoopDragMode drag_mode,
+                                       gdouble drag_anchor_frames,
+                                       gdouble drag_offset_frames,
+                                       gdouble loop_start_frames,
+                                       gdouble loop_end_frames,
+                                       gdouble current_frames,
+                                       gdouble *start_frames,
+                                       gdouble *end_frames) {
+  if (!start_frames || !end_frames) {
+    return FALSE;
+  }
+
+  switch (drag_mode) {
+    case LOOP_DRAG_CREATE:
+      *start_frames = drag_anchor_frames;
+      *end_frames = current_frames;
+      return TRUE;
+    case LOOP_DRAG_START:
+      *start_frames = current_frames;
+      *end_frames = loop_end_frames;
+      return TRUE;
+    case LOOP_DRAG_END:
+      *start_frames = loop_start_frames;
+      *end_frames = current_frames;
+      return TRUE;
+    case LOOP_DRAG_MOVE: {
+      gdouble width = loop_end_frames - loop_start_frames;
+      gdouble new_start = current_frames - drag_offset_frames;
+      *start_frames = new_start;
+      *end_frames = new_start + width;
+      return TRUE;
+    }
+    case LOOP_DRAG_NONE:
+    default:
+      return FALSE;
+  }
+}
+
+CoreWaveformPressAction core_resolve_waveform_press(AppMode mode,
+                                                    gboolean shift,
+                                                    gboolean effective_region_set,
+                                                    gboolean near_start,
+                                                    gboolean near_end,
+                                                    gboolean has_frames) {
+  if (mode == MODE_RENDERING && !shift && has_frames) {
+    return CORE_WAVEFORM_PRESS_RENDER_SEEK;
+  }
+  if (shift && has_frames) {
+    return CORE_WAVEFORM_PRESS_LOOP_CREATE;
+  }
+  if (effective_region_set) {
+    if (near_start) {
+      return CORE_WAVEFORM_PRESS_LOOP_START;
+    }
+    if (near_end) {
+      return CORE_WAVEFORM_PRESS_LOOP_END;
+    }
+  }
+  if (has_frames) {
+    return CORE_WAVEFORM_PRESS_SCRUB;
+  }
+  return CORE_WAVEFORM_PRESS_IGNORE;
+}
+
+void core_set_loop_drag(LoopState *loop, LoopDragMode mode, gdouble anchor_frames, gdouble offset_frames) {
+  if (!loop) {
+    return;
+  }
+
+  loop->drag_mode = mode;
+  loop->drag_anchor_frames = anchor_frames;
+  loop->drag_offset_frames = offset_frames;
+}
+
+void core_clear_loop_drag(LoopState *loop) {
+  if (!loop) {
+    return;
+  }
+
+  loop->drag_mode = LOOP_DRAG_NONE;
+  loop->drag_anchor_frames = 0.0;
+  loop->drag_offset_frames = 0.0;
 }
 
 void core_finalize_loop_region(LoopState *loop, gdouble total_frames, gdouble start_frames, gdouble end_frames, gdouble min_width) {
@@ -295,14 +399,104 @@ gdouble core_compute_target_frames(gdouble total_frames, gdouble fraction) {
   return total_frames * fraction;
 }
 
+void core_set_playback_cursor_state(gdouble frames,
+                                    gdouble *playback_cursor_frames,
+                                    gdouble *playback_anchor_frames,
+                                    gint64 *playback_anchor_us,
+                                    gdouble *display_playhead_frames) {
+  if (frames < 0.0) {
+    frames = 0.0;
+  }
+  if (playback_cursor_frames) {
+    *playback_cursor_frames = frames;
+  }
+  if (playback_anchor_frames) {
+    *playback_anchor_frames = frames;
+  }
+  if (playback_anchor_us) {
+    *playback_anchor_us = g_get_monotonic_time();
+  }
+  if (display_playhead_frames) {
+    *display_playhead_frames = frames;
+  }
+}
+
+gdouble core_apply_seek_fraction(AppMode mode,
+                                  gdouble total_frames,
+                                  gdouble fraction,
+                                  gdouble *playback_cursor_frames,
+                                 gdouble *playback_anchor_frames,
+                                  gint64 *playback_anchor_us,
+                                  gdouble *display_playhead_frames,
+                                  RenderIntent *intent) {
+  gdouble target_frames = core_compute_target_frames(total_frames, fraction);
+
+  core_set_playback_cursor_state(target_frames,
+                                 playback_cursor_frames,
+                                 playback_anchor_frames,
+                                 playback_anchor_us,
+                                 display_playhead_frames);
+  if (intent && (mode == MODE_RECORDING || mode == MODE_RENDERING)) {
+    intent->seek_valid = TRUE;
+    intent->seek_pos = target_frames;
+  }
+
+  return target_frames;
+}
+
+gboolean core_begin_scrub(AppMode mode, gboolean already_scrubbing, gboolean *resume_after_scrub) {
+  if (already_scrubbing || mode == MODE_RENDERING) {
+    return FALSE;
+  }
+
+  if (resume_after_scrub) {
+    *resume_after_scrub = (mode == MODE_PLAYING);
+  }
+
+  return TRUE;
+}
+
+gboolean core_end_scrub(gboolean *resume_after_scrub) {
+  gboolean resume = FALSE;
+
+  if (resume_after_scrub) {
+    resume = *resume_after_scrub;
+    *resume_after_scrub = FALSE;
+  }
+
+  return resume;
+}
+
+AppMode core_capture_final_mode(AppMode current_mode, gboolean force_stopped) {
+  if (force_stopped || current_mode != MODE_PAUSED) {
+    return MODE_IDLE;
+  }
+
+  return MODE_PAUSED;
+}
+
+AppMode core_playback_final_mode(AppMode current_mode, gboolean reached_end) {
+  if (reached_end) {
+    return MODE_IDLE;
+  }
+  if (current_mode == MODE_PREPARING) {
+    return MODE_IDLE;
+  }
+  if (current_mode == MODE_PLAYING) {
+    return MODE_PAUSED;
+  }
+
+  return current_mode;
+}
+
 gdouble core_compute_current_playback_frames(AppMode mode,
-                                             gboolean scrubbing,
-                                             gdouble cursor_frames,
-                                             gdouble anchor_frames,
-                                             gint64 anchor_us,
-                                             guint rate,
-                                             gdouble speed,
-                                             gint64 now_us) {
+                                              gboolean scrubbing,
+                                              gdouble cursor_frames,
+                                              gdouble anchor_frames,
+                                              gint64 anchor_us,
+                                              guint rate,
+                                              gdouble speed,
+                                              gint64 now_us) {
   if (scrubbing) {
     return cursor_frames;
   }
@@ -317,4 +511,41 @@ gdouble core_compute_current_playback_frames(AppMode mode,
   }
 
   return cursor_frames;
+}
+
+gdouble core_update_display_playhead(AppMode mode,
+                                     gboolean scrubbing,
+                                     gdouble display_playhead_frames,
+                                     gdouble playback_cursor_frames,
+                                     gdouble playback_anchor_frames,
+                                     gint64 playback_anchor_us,
+                                     guint rate,
+                                     gdouble speed,
+                                     gint64 now_us) {
+  gdouble current_frames = core_compute_current_playback_frames(mode,
+                                                                scrubbing,
+                                                                playback_cursor_frames,
+                                                                playback_anchor_frames,
+                                                                playback_anchor_us,
+                                                                rate,
+                                                                speed,
+                                                                now_us);
+
+  if (scrubbing) {
+    return current_frames;
+  }
+
+  if (mode == MODE_PLAYING) {
+    gdouble delta = current_frames - display_playhead_frames;
+    if (delta < 0.0) {
+      delta = 0.0;
+    }
+    display_playhead_frames += delta * 0.35;
+    if (current_frames - display_playhead_frames < 0.5) {
+      display_playhead_frames = current_frames;
+    }
+    return display_playhead_frames;
+  }
+
+  return current_frames;
 }

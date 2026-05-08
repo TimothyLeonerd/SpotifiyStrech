@@ -121,7 +121,6 @@ static void set_mode(Recorder *r, AppMode mode) {
 }
 
 static void invalidate_playback_buffer_locked(Recorder *r);
-static void set_playback_cursor_locked(Recorder *r, gdouble frames);
 static gboolean start_capture_thread(Recorder *r, gboolean reset_buffers);
 static void stop_capture_thread(Recorder *r, gboolean force_stopped);
 static gboolean start_playback_thread(Recorder *r);
@@ -192,35 +191,21 @@ static void on_loop_toggled(GtkToggleButton *button, gpointer user_data);
 static void update_display_playhead(Recorder *r) {
   AppMode mode;
   gboolean scrubbing = FALSE;
-  gdouble current_frames = 0.0;
   gdouble display_frames = 0.0;
 
   g_mutex_lock(&r->mutex);
   mode = r->mode;
   scrubbing = r->scrubbing;
   display_frames = r->display_playhead_frames;
-  current_frames = core_compute_current_playback_frames(mode,
-                                                       scrubbing,
-                                                       r->playback_cursor_frames,
-                                                       r->playback_anchor_frames,
-                                                       r->playback_anchor_us,
-                                                       r->audio.sample_rate ? r->audio.sample_rate : 1,
-                                                       r->speed,
-                                                       g_get_monotonic_time());
-  if (scrubbing) {
-    display_frames = current_frames;
-  } else if (mode == MODE_PLAYING) {
-    gdouble delta = current_frames - display_frames;
-    if (delta < 0.0) {
-      delta = 0.0;
-    }
-    display_frames += delta * 0.35;
-    if (current_frames - display_frames < 0.5) {
-      display_frames = current_frames;
-    }
-  } else {
-    display_frames = current_frames;
-  }
+  display_frames = core_update_display_playhead(mode,
+                                                scrubbing,
+                                                display_frames,
+                                                r->playback_cursor_frames,
+                                                r->playback_anchor_frames,
+                                                r->playback_anchor_us,
+                                                r->audio.sample_rate ? r->audio.sample_rate : 1,
+                                                r->speed,
+                                                g_get_monotonic_time());
   r->display_playhead_frames = display_frames;
   g_mutex_unlock(&r->mutex);
 }
@@ -305,18 +290,10 @@ static void refresh_ui(Recorder *r) {
   }
 }
 
-static void set_playback_cursor_locked(Recorder *r, gdouble frames) {
-  r->playback_cursor_frames = frames;
-  r->playback_anchor_frames = frames;
-  r->playback_anchor_us = g_get_monotonic_time();
-  r->display_playhead_frames = frames;
-}
-
 static void seek_to_fraction(Recorder *r, double fraction) {
   AppMode mode;
   gboolean scrubbing = FALSE;
   gdouble total_frames = 0.0;
-  gdouble target_frames = 0.0;
 
   if (fraction < 0.0) {
     fraction = 0.0;
@@ -329,12 +306,14 @@ static void seek_to_fraction(Recorder *r, double fraction) {
   mode = r->mode;
   scrubbing = r->scrubbing;
   total_frames = (gdouble)r->audio.captured_frames;
-  target_frames = core_compute_target_frames(total_frames, fraction);
-  set_playback_cursor_locked(r, target_frames);
-  if (mode == MODE_RECORDING || mode == MODE_RENDERING) {
-    r->render_intent.seek_valid = TRUE;
-    r->render_intent.seek_pos = target_frames;
-  }
+  core_apply_seek_fraction(mode,
+                           total_frames,
+                           fraction,
+                           &r->playback_cursor_frames,
+                           &r->playback_anchor_frames,
+                           &r->playback_anchor_us,
+                           &r->display_playhead_frames,
+                           &r->render_intent);
   g_mutex_unlock(&r->mutex);
 
   if (mode == MODE_PLAYING && !scrubbing) {
@@ -351,19 +330,16 @@ static void seek_to_fraction(Recorder *r, double fraction) {
 
 static void begin_scrub(Recorder *r) {
   gboolean was_playing = FALSE;
+  gboolean resume_after_scrub = FALSE;
 
   g_mutex_lock(&r->mutex);
-  if (r->scrubbing) {
-    g_mutex_unlock(&r->mutex);
-    return;
-  }
-  if (r->mode == MODE_RENDERING) {
+  if (!core_begin_scrub(r->mode, r->scrubbing, &resume_after_scrub)) {
     g_mutex_unlock(&r->mutex);
     return;
   }
   r->scrubbing = TRUE;
-  was_playing = (r->mode == MODE_PLAYING);
-  r->resume_after_scrub = was_playing;
+  r->resume_after_scrub = resume_after_scrub;
+  was_playing = resume_after_scrub;
   g_mutex_unlock(&r->mutex);
 
   g_printerr("[scrub] begin resume=%d\n", was_playing ? 1 : 0);
@@ -387,8 +363,14 @@ static void update_scrub(Recorder *r, double fraction) {
   g_mutex_lock(&r->mutex);
   mode = r->mode;
   total_frames = (gdouble)r->audio.captured_frames;
-  target_frames = core_compute_target_frames(total_frames, fraction);
-  set_playback_cursor_locked(r, target_frames);
+  target_frames = core_apply_seek_fraction(mode,
+                                          total_frames,
+                                          fraction,
+                                          &r->playback_cursor_frames,
+                                          &r->playback_anchor_frames,
+                                          &r->playback_anchor_us,
+                                          &r->display_playhead_frames,
+                                          NULL);
   g_mutex_unlock(&r->mutex);
 
   g_printerr("[scrub] fraction=%.3f target_frames=%.1f mode=%d\n", fraction, target_frames, mode);
@@ -407,8 +389,7 @@ static void end_scrub(Recorder *r) {
     return;
   }
   r->scrubbing = FALSE;
-  resume = r->resume_after_scrub;
-  r->resume_after_scrub = FALSE;
+  resume = core_end_scrub(&r->resume_after_scrub);
   g_mutex_unlock(&r->mutex);
 
   g_printerr("[scrub] end resume=%d\n", resume ? 1 : 0);
@@ -474,22 +455,6 @@ static void finalize_loop_region(Recorder *r, gdouble start_frames, gdouble end_
   total_frames = (gdouble)r->audio.captured_frames;
   g_mutex_unlock(&r->mutex);
   core_finalize_loop_region(&r->loop, total_frames, start_frames, end_frames, min_width);
-}
-
-static void set_loop_drag(Recorder *r, LoopDragMode mode, gdouble anchor_frames, gdouble offset_frames) {
-  g_mutex_lock(&r->mutex);
-  r->loop.drag_mode = mode;
-  r->loop.drag_anchor_frames = anchor_frames;
-  r->loop.drag_offset_frames = offset_frames;
-  g_mutex_unlock(&r->mutex);
-}
-
-static void clear_loop_drag(Recorder *r) {
-  g_mutex_lock(&r->mutex);
-  r->loop.drag_mode = LOOP_DRAG_NONE;
-  r->loop.drag_anchor_frames = 0.0;
-  r->loop.drag_offset_frames = 0.0;
-  g_mutex_unlock(&r->mutex);
 }
 
 static gboolean playhead_tick_cb(GtkWidget *widget, GdkFrameClock *frame_clock, gpointer user_data) {
@@ -1629,11 +1594,7 @@ cleanup:
   if (!flush_on_exit) {
     rec->display_playhead_frames = rec->playback_cursor_frames;
   }
-  if (reached_end) {
-    rec->mode = MODE_IDLE;
-  } else if (rec->mode == MODE_PREPARING) {
-    rec->mode = MODE_IDLE;
-  }
+  rec->mode = core_playback_final_mode(rec->mode, reached_end);
   rec->playback_running = FALSE;
   rec->playback_thread = NULL;
   rec->playback_stop_requested = FALSE;
@@ -1725,9 +1686,17 @@ static void stop_playback_thread(Recorder *r, gboolean reset_cursor) {
 
   g_mutex_lock(&r->mutex);
   if (reset_cursor) {
-    set_playback_cursor_locked(r, 0.0);
+    core_set_playback_cursor_state(0.0,
+                                   &r->playback_cursor_frames,
+                                   &r->playback_anchor_frames,
+                                   &r->playback_anchor_us,
+                                   &r->display_playhead_frames);
   } else {
-    set_playback_cursor_locked(r, preserved_display_frames);
+    core_set_playback_cursor_state(preserved_display_frames,
+                                   &r->playback_cursor_frames,
+                                   &r->playback_anchor_frames,
+                                   &r->playback_anchor_us,
+                                   &r->display_playhead_frames);
   }
   r->playback_thread = NULL;
   r->playback_running = FALSE;
@@ -1753,22 +1722,18 @@ static void stop_capture_thread(Recorder *r, gboolean force_stopped) {
   r->capture_thread = NULL;
   r->capture_running = FALSE;
   r->stop_requested = FALSE;
-  if (force_stopped || r->mode != MODE_PAUSED) {
-    r->mode = MODE_IDLE;
-  }
+  r->mode = core_capture_final_mode(r->mode, force_stopped);
   g_mutex_unlock(&r->mutex);
 }
 
-static void transport_stop(Recorder *r) {
-  CoreTransportPlan plan;
+static void transport_stop(Recorder *r, const CoreTransportPlan *plan) {
   GThread *render_thread = NULL;
 
-  g_mutex_lock(&r->mutex);
-  plan = core_transport_stop_plan(r->mode, r->render_pending);
-  if (plan.should_cancel_render) {
-    render_thread = cancel_render_locked(r, plan.next_mode);
+  if (plan->should_cancel_render) {
+    g_mutex_lock(&r->mutex);
+    render_thread = cancel_render_locked(r, plan->next_mode);
+    g_mutex_unlock(&r->mutex);
   }
-  g_mutex_unlock(&r->mutex);
 
   if (render_thread) {
     g_thread_unref(render_thread);
@@ -1776,31 +1741,29 @@ static void transport_stop(Recorder *r) {
       r->platform.ui->set_progress_visible(r->platform.backend.user_data, FALSE);
     }
   } else {
-    if (plan.should_stop_playback) {
+    if (plan->should_stop_playback) {
       if (r->platform.audio && r->platform.audio->stop_playback) {
-        r->platform.audio->stop_playback(r->platform.backend.user_data, !plan.preserve_cursor);
+        r->platform.audio->stop_playback(r->platform.backend.user_data, !plan->preserve_cursor);
       }
     }
-    if (plan.should_stop_capture) {
+    if (plan->should_stop_capture) {
       if (r->platform.audio && r->platform.audio->stop_capture) {
         r->platform.audio->stop_capture(r->platform.backend.user_data, FALSE);
       }
     }
-    set_mode(r, plan.next_mode);
+    set_mode(r, plan->next_mode);
   }
   refresh_ui(r);
 }
 
-static void transport_start_recording(Recorder *r) {
-  CoreTransportPlan plan;
+static void transport_start_recording(Recorder *r, const CoreTransportPlan *plan) {
   GThread *render_thread = NULL;
 
-  g_mutex_lock(&r->mutex);
-  plan = core_transport_record_plan(r->mode, r->render_pending, r->capture_running);
-  if (plan.should_cancel_render) {
-    render_thread = cancel_render_locked(r, plan.next_mode);
+  if (plan->should_cancel_render) {
+    g_mutex_lock(&r->mutex);
+    render_thread = cancel_render_locked(r, plan->next_mode);
+    g_mutex_unlock(&r->mutex);
   }
-  g_mutex_unlock(&r->mutex);
 
   if (render_thread) {
     g_thread_unref(render_thread);
@@ -1809,17 +1772,17 @@ static void transport_start_recording(Recorder *r) {
     }
   }
 
-  if (plan.should_start) {
+  if (plan->should_start) {
     g_printerr("[ui] record clicked: starting\n");
-    if (plan.should_stop_playback) {
+    if (plan->should_stop_playback) {
       if (r->platform.audio && r->platform.audio->stop_playback) {
         r->platform.audio->stop_playback(r->platform.backend.user_data, TRUE);
       }
     }
-    if (!r->platform.audio || !r->platform.audio->start_capture || !r->platform.audio->start_capture(r->platform.backend.user_data, plan.reset_buffers)) {
+    if (!r->platform.audio || !r->platform.audio->start_capture || !r->platform.audio->start_capture(r->platform.backend.user_data, plan->reset_buffers)) {
       set_error(r, "Failed to start capture thread");
     }
-    set_mode(r, plan.next_mode);
+    set_mode(r, plan->next_mode);
   }
 
   refresh_ui(r);
@@ -1837,7 +1800,11 @@ static gboolean transport_play_from_idle(Recorder *r) {
   }
 
   g_mutex_lock(&r->mutex);
-  set_playback_cursor_locked(r, preserved_cursor);
+  core_set_playback_cursor_state(preserved_cursor,
+                                 &r->playback_cursor_frames,
+                                 &r->playback_anchor_frames,
+                                 &r->playback_anchor_us,
+                                 &r->display_playhead_frames);
   g_mutex_unlock(&r->mutex);
   return r->platform.audio && r->platform.audio->start_playback
     ? r->platform.audio->start_playback(r->platform.backend.user_data)
@@ -1850,7 +1817,11 @@ static void transport_pause(Recorder *r) {
   g_mutex_lock(&r->mutex);
   paused_frames = r->display_playhead_frames;
   r->mode = MODE_PAUSED;
-  set_playback_cursor_locked(r, paused_frames);
+  core_set_playback_cursor_state(paused_frames,
+                                 &r->playback_cursor_frames,
+                                 &r->playback_anchor_frames,
+                                 &r->playback_anchor_us,
+                                 &r->display_playhead_frames);
   g_printerr("[ui] playback paused\n");
   g_mutex_unlock(&r->mutex);
 
@@ -1864,13 +1835,17 @@ static void transport_resume(Recorder *r) {
 
   g_mutex_lock(&r->mutex);
   resumed_frames = r->display_playhead_frames;
-  set_playback_cursor_locked(r, resumed_frames);
+  core_set_playback_cursor_state(resumed_frames,
+                                 &r->playback_cursor_frames,
+                                 &r->playback_anchor_frames,
+                                 &r->playback_anchor_us,
+                                 &r->display_playhead_frames);
   g_printerr("[ui] playback resumed\n");
   g_mutex_unlock(&r->mutex);
 
-    if (!r->platform.audio || !r->platform.audio->start_playback || !r->platform.audio->start_playback(r->platform.backend.user_data)) {
-      set_error(r, "Failed to resume playback");
-    }
+  if (!r->platform.audio || !r->platform.audio->start_playback || !r->platform.audio->start_playback(r->platform.backend.user_data)) {
+    set_error(r, "Failed to resume playback");
+  }
 }
 
 static void transport_set_speed(Recorder *r, gdouble speed) {
@@ -1928,21 +1903,22 @@ static void transport_set_speed(Recorder *r, gdouble speed) {
 
 static void transport_dispatch(Recorder *r, TransportAction action) {
   AppMode mode;
-  CorePlayPauseAction play_pause_action;
+  CoreTransportDecision decision;
+
+  g_mutex_lock(&r->mutex);
+  mode = r->mode;
+  decision = core_transport_decision(mode, r->render_pending, r->capture_running, action);
+  g_mutex_unlock(&r->mutex);
 
   switch (action) {
     case TRANSPORT_ACTION_RECORD:
-      transport_start_recording(r);
+      transport_start_recording(r, &decision.plan);
       return;
     case TRANSPORT_ACTION_STOP:
-      transport_stop(r);
+      transport_stop(r, &decision.plan);
       return;
     case TRANSPORT_ACTION_PLAY_PAUSE:
-      g_mutex_lock(&r->mutex);
-      mode = r->mode;
-      g_mutex_unlock(&r->mutex);
-      play_pause_action = core_transport_play_pause_action(mode);
-      switch (play_pause_action) {
+      switch (decision.play_pause_action) {
         case CORE_PLAY_PAUSE_START_FROM_IDLE:
           if (transport_play_from_idle(r)) {
             refresh_ui(r);
@@ -2058,8 +2034,6 @@ static gboolean on_waveform_button_press(GtkWidget *widget, GdkEventButton *even
   gdouble loop_end = 0.0;
   gboolean shift = FALSE;
   gboolean effective_region_set = FALSE;
-  gboolean near_start = FALSE;
-  gboolean near_end = FALSE;
   gdouble handle_window = 0.0;
 
   if (event->button != 1) {
@@ -2075,12 +2049,28 @@ static gboolean on_waveform_button_press(GtkWidget *widget, GdkEventButton *even
   total_frames = (gdouble)r->audio.captured_frames;
   AppMode mode = r->mode;
   shift = (event->state & GDK_SHIFT_MASK) != 0;
-  if (mode == MODE_RENDERING && !shift && total_frames > 0.0) {
-    gdouble seek_frames = core_compute_target_frames(total_frames, event->x / (double)allocation.width);
-    set_playback_cursor_locked(r, seek_frames);
-    r->render_intent.seek_valid = TRUE;
-    r->render_intent.seek_pos = seek_frames;
-    g_mutex_unlock(&r->mutex);
+  effective_region_set = get_effective_loop_region_locked(r, total_frames, &loop_start, &loop_end);
+  g_mutex_unlock(&r->mutex);
+
+  target_frames = core_compute_target_frames(total_frames, event->x / (double)allocation.width);
+  handle_window = MAX(loop_min_width_frames(r) * 0.25, total_frames * 10.0 / (double)allocation.width);
+
+  CoreWaveformPressAction press_action = core_resolve_waveform_press(mode,
+                                                                      shift,
+                                                                      effective_region_set,
+                                                                      fabs(target_frames - loop_start) <= handle_window,
+                                                                      fabs(target_frames - loop_end) <= handle_window,
+                                                                      total_frames > 0.0);
+
+  if (press_action == CORE_WAVEFORM_PRESS_RENDER_SEEK) {
+    core_apply_seek_fraction(mode,
+                             total_frames,
+                             event->x / (double)allocation.width,
+                             &r->playback_cursor_frames,
+                             &r->playback_anchor_frames,
+                             &r->playback_anchor_us,
+                             &r->display_playhead_frames,
+                             &r->render_intent);
     update_time_label(r);
     if (r->platform.ui && r->platform.ui->queue_waveform_redraw) {
       r->platform.ui->queue_waveform_redraw(r->platform.backend.user_data);
@@ -2088,14 +2078,11 @@ static gboolean on_waveform_button_press(GtkWidget *widget, GdkEventButton *even
     refresh_ui(r);
     return TRUE;
   }
-  effective_region_set = get_effective_loop_region_locked(r, total_frames, &loop_start, &loop_end);
-  g_mutex_unlock(&r->mutex);
 
-  target_frames = core_compute_target_frames(total_frames, event->x / (double)allocation.width);
-  handle_window = MAX(loop_min_width_frames(r) * 0.25, total_frames * 10.0 / (double)allocation.width);
-
-  if (shift && total_frames > 0.0) {
-    set_loop_drag(r, LOOP_DRAG_CREATE, target_frames, 0.0);
+  if (press_action == CORE_WAVEFORM_PRESS_LOOP_CREATE) {
+    g_mutex_lock(&r->mutex);
+    core_set_loop_drag(&r->loop, LOOP_DRAG_CREATE, target_frames, 0.0);
+    g_mutex_unlock(&r->mutex);
     if (!r->platform.ui || !r->platform.ui->grab_pointer || !r->platform.ui->grab_pointer(r->platform.backend.user_data, widget, event)) {
       g_printerr("[loop] pointer grab failed\n");
     }
@@ -2105,35 +2092,38 @@ static gboolean on_waveform_button_press(GtkWidget *widget, GdkEventButton *even
     return TRUE;
   }
 
-  if (effective_region_set) {
-    near_start = fabs(target_frames - loop_start) <= handle_window;
-    near_end = fabs(target_frames - loop_end) <= handle_window;
-
-    if (near_start) {
-      set_loop_drag(r, LOOP_DRAG_START, 0.0, 0.0);
-      if (!r->platform.ui || !r->platform.ui->grab_pointer || !r->platform.ui->grab_pointer(r->platform.backend.user_data, widget, event)) {
-        g_printerr("[loop] pointer grab failed\n");
-      }
-      return TRUE;
+  if (press_action == CORE_WAVEFORM_PRESS_LOOP_START) {
+    g_mutex_lock(&r->mutex);
+    core_set_loop_drag(&r->loop, LOOP_DRAG_START, 0.0, 0.0);
+    g_mutex_unlock(&r->mutex);
+    if (!r->platform.ui || !r->platform.ui->grab_pointer || !r->platform.ui->grab_pointer(r->platform.backend.user_data, widget, event)) {
+      g_printerr("[loop] pointer grab failed\n");
     }
+    return TRUE;
+  }
 
-    if (near_end) {
-      set_loop_drag(r, LOOP_DRAG_END, 0.0, 0.0);
-      if (!r->platform.ui || !r->platform.ui->grab_pointer || !r->platform.ui->grab_pointer(r->platform.backend.user_data, widget, event)) {
-        g_printerr("[loop] pointer grab failed\n");
-      }
-      return TRUE;
+  if (press_action == CORE_WAVEFORM_PRESS_LOOP_END) {
+    g_mutex_lock(&r->mutex);
+    core_set_loop_drag(&r->loop, LOOP_DRAG_END, 0.0, 0.0);
+    g_mutex_unlock(&r->mutex);
+    if (!r->platform.ui || !r->platform.ui->grab_pointer || !r->platform.ui->grab_pointer(r->platform.backend.user_data, widget, event)) {
+      g_printerr("[loop] pointer grab failed\n");
     }
+    return TRUE;
   }
 
-  begin_scrub(r);
-  if (!r->platform.ui || !r->platform.ui->grab_pointer || !r->platform.ui->grab_pointer(r->platform.backend.user_data, widget, event)) {
-    g_printerr("[scrub] pointer grab failed\n");
+  if (press_action == CORE_WAVEFORM_PRESS_SCRUB) {
+    begin_scrub(r);
+    if (!r->platform.ui || !r->platform.ui->grab_pointer || !r->platform.ui->grab_pointer(r->platform.backend.user_data, widget, event)) {
+      g_printerr("[scrub] pointer grab failed\n");
+    }
+    if (total_frames > 0.0) {
+      seek_to_fraction(r, target_frames / total_frames);
+    }
+    return TRUE;
   }
-  if (total_frames > 0.0) {
-    seek_to_fraction(r, target_frames / total_frames);
-  }
-  return TRUE;
+
+  return FALSE;
 }
 
 static gboolean on_waveform_button_release(GtkWidget *widget, GdkEventButton *event, gpointer user_data) {
@@ -2167,27 +2157,20 @@ static gboolean on_waveform_button_release(GtkWidget *widget, GdkEventButton *ev
       current_frames = (event->x / (double)gtk_widget_get_allocated_width(widget)) * total_frames;
     }
 
-    switch (drag_mode) {
-      case LOOP_DRAG_CREATE:
-        finalize_loop_region(r, drag_anchor, current_frames);
-        break;
-      case LOOP_DRAG_START:
-        finalize_loop_region(r, current_frames, loop_end);
-        break;
-      case LOOP_DRAG_END:
-        finalize_loop_region(r, loop_start, current_frames);
-        break;
-      case LOOP_DRAG_MOVE: {
-        gdouble width = loop_end - loop_start;
-        gdouble new_start = current_frames - drag_offset;
-        finalize_loop_region(r, new_start, new_start + width);
-        break;
-      }
-      case LOOP_DRAG_NONE:
-        break;
+    if (core_compute_loop_drag_region(drag_mode,
+                                      drag_anchor,
+                                      drag_offset,
+                                      loop_start,
+                                      loop_end,
+                                      current_frames,
+                                      &loop_start,
+                                      &loop_end)) {
+      finalize_loop_region(r, loop_start, loop_end);
     }
 
-    clear_loop_drag(r);
+    g_mutex_lock(&r->mutex);
+    core_clear_loop_drag(&r->loop);
+    g_mutex_unlock(&r->mutex);
     refresh_ui(r);
     if (r->platform.ui && r->platform.ui->queue_waveform_redraw) {
       r->platform.ui->queue_waveform_redraw(r->platform.backend.user_data);
@@ -2232,24 +2215,15 @@ static gboolean on_waveform_motion(GtkWidget *widget, GdkEventMotion *event, gpo
     fraction = x / (double)allocation.width;
     current_frames = fraction * total_frames;
 
-    switch (drag_mode) {
-      case LOOP_DRAG_CREATE:
-        finalize_loop_region(r, drag_anchor, current_frames);
-        break;
-      case LOOP_DRAG_START:
-        finalize_loop_region(r, current_frames, loop_end);
-        break;
-      case LOOP_DRAG_END:
-        finalize_loop_region(r, loop_start, current_frames);
-        break;
-      case LOOP_DRAG_MOVE: {
-        gdouble width = loop_end - loop_start;
-        gdouble new_start = current_frames - drag_offset;
-        finalize_loop_region(r, new_start, new_start + width);
-        break;
-      }
-      case LOOP_DRAG_NONE:
-        break;
+    if (core_compute_loop_drag_region(drag_mode,
+                                      drag_anchor,
+                                      drag_offset,
+                                      loop_start,
+                                      loop_end,
+                                      current_frames,
+                                      &loop_start,
+                                      &loop_end)) {
+      finalize_loop_region(r, loop_start, loop_end);
     }
 
     if (r->platform.ui && r->platform.ui->queue_waveform_redraw) {

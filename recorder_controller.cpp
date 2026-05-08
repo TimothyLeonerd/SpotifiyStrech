@@ -5,6 +5,7 @@
 #include <cmath>
 #include <iomanip>
 #include <sstream>
+#include <vector>
 
 namespace {
 std::int64_t nowUs() {
@@ -168,6 +169,26 @@ double RecorderController::loopEndRatio() const {
 
 bool RecorderController::loopRegionSet() const {
   return loop_region_set_;
+}
+
+std::vector<int> RecorderController::waveformPeaks() const {
+  std::vector<int> peaks;
+  peaks.reserve(480);
+
+  const double seconds = std::max(0.1, capturedSeconds());
+  const double play = playheadRatio();
+  const double speed_value = speed_;
+
+  for (int i = 0; i < 480; ++i) {
+    const double x = static_cast<double>(i) / 480.0;
+    const double envelope = 0.35 + 0.35 * std::sin((x * 8.0) + seconds * 0.75);
+    const double ripple = 0.2 * std::sin((x * 46.0) + play * 12.0) + 0.12 * std::cos((x * 89.0) + speed_value * 3.0);
+    const double base = 0.5 + envelope + ripple;
+    const double shaped = std::max(0.06, std::min(1.0, base));
+    peaks.push_back(static_cast<int>(shaped * 100.0));
+  }
+
+  return peaks;
 }
 
 const char *RecorderController::modeText(RecorderMode mode) {
