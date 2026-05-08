@@ -1,12 +1,14 @@
 # Windows Port Notes
 
 ## Goal
-Port the current Linux GTK3/PulseAudio app to Windows while keeping the existing core behavior.
+Port the current app to a Qt Widgets UI while keeping the existing core behavior.
 
 ## Current Architecture
 - `core.c` / `core.h`: portable logic
-- `app.c`: GTK3 + PulseAudio adapter/UI layer
+- `app.c`: current GTK3 + PulseAudio app path
+- `qt_main.cpp` / `qt_recorder_window.cpp`: Qt Widgets UI shell
 - `Makefile`: Linux build for GTK3, PulseAudio, Rubber Band
+- `CMakeLists.txt`: Qt Widgets build path
 
 ## Portable Core
 Already extracted into `core.c` / `core.h`:
@@ -35,18 +37,22 @@ Still in `app.c`:
 - recording-time seek should survive into playback
 
 ## Likely Windows Replacements
-- GTK UI -> Windows UI toolkit of choice
+- GTK UI -> Qt Widgets
 - PulseAudio -> Windows audio API/backend
 - pointer/input handling -> Windows event system
-- drawing -> Windows drawing API or chosen UI toolkit
+- drawing -> Qt painting
 
 ## Recommended Next Step
-Keep `core.c` unchanged and replace only the platform adapters.
+Keep `core.c` unchanged and move the recorder UI/host into Qt Widgets.
 
 Suggested adapter split:
 - audio backend: capture/playback/device selection
-- UI backend: labels, buttons, progress, redraw
-- input backend: seek/scrub/loop interactions
+- UI backend: Qt widgets, labels, buttons, progress, redraw
+- input backend: Qt mouse/keyboard interactions
+
+Build path:
+- configure with CMake
+- build `spotify-recorder-qt`
 
 ## Notes
 - Current Linux build is clean.

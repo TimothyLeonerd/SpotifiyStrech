@@ -12,6 +12,8 @@
 #include <pulse/simple.h>
 
 #include "core.h"
+#include "platform.h"
+#include "platform_linux.h"
 #include "third_party/rubberband/rubberband/rubberband-c.h"
 
 typedef struct {
@@ -28,6 +30,8 @@ typedef struct {
 
 typedef struct {
   AppWidgets widgets;
+  PlatformLinuxUiContext linux_ui;
+  PlatformAdapters platform;
 
   GMutex mutex;
   AudioBuffer audio;
@@ -98,11 +102,16 @@ static void update_button_sensitivity(Recorder *r) {
   ui_state = core_build_ui_state(r->mode, r->render_intent.should_play);
   g_mutex_unlock(&r->mutex);
 
-  gtk_widget_set_sensitive(r->widgets.record_button, ui_state.record_enabled);
-  gtk_widget_set_sensitive(r->widgets.play_pause_button, ui_state.play_pause_enabled);
-  gtk_widget_set_sensitive(r->widgets.loop_button, ui_state.loop_enabled);
-  gtk_widget_set_sensitive(r->widgets.stop_button, ui_state.stop_enabled);
-  gtk_button_set_label(GTK_BUTTON(r->widgets.play_pause_button), ui_state.play_pause_label);
+  if (r->platform.ui && r->platform.ui->set_controls_sensitive) {
+    r->platform.ui->set_controls_sensitive(r->platform.backend.user_data,
+                                           ui_state.record_enabled,
+                                           ui_state.play_pause_enabled,
+                                           ui_state.loop_enabled,
+                                           ui_state.stop_enabled);
+  }
+  if (r->platform.ui && r->platform.ui->set_play_pause_label) {
+    r->platform.ui->set_play_pause_label(r->platform.backend.user_data, ui_state.play_pause_label);
+  }
 }
 
 static void set_mode(Recorder *r, AppMode mode) {
@@ -113,6 +122,33 @@ static void set_mode(Recorder *r, AppMode mode) {
 
 static void invalidate_playback_buffer_locked(Recorder *r);
 static void set_playback_cursor_locked(Recorder *r, gdouble frames);
+static gboolean start_capture_thread(Recorder *r, gboolean reset_buffers);
+static void stop_capture_thread(Recorder *r, gboolean force_stopped);
+static gboolean start_playback_thread(Recorder *r);
+static void stop_playback_thread(Recorder *r, gboolean reset_cursor);
+
+static gboolean linux_audio_start_capture(void *user_data, gboolean reset_buffers) {
+  return start_capture_thread((Recorder *)user_data, reset_buffers);
+}
+
+static void linux_audio_stop_capture(void *user_data, gboolean force_stopped) {
+  stop_capture_thread((Recorder *)user_data, force_stopped);
+}
+
+static gboolean linux_audio_start_playback(void *user_data) {
+  return start_playback_thread((Recorder *)user_data);
+}
+
+static void linux_audio_stop_playback(void *user_data, gboolean reset_cursor) {
+  stop_playback_thread((Recorder *)user_data, reset_cursor);
+}
+
+static const PlatformAudioVTable linux_audio_vtable = {
+  .start_capture = linux_audio_start_capture,
+  .stop_capture = linux_audio_stop_capture,
+  .start_playback = linux_audio_start_playback,
+  .stop_playback = linux_audio_stop_playback,
+};
 
 static GThread *cancel_render_locked(Recorder *r, AppMode next_mode) {
   GThread *render_thread = NULL;
@@ -202,7 +238,9 @@ static void update_time_label(Recorder *r) {
   g_mutex_unlock(&r->mutex);
 
   time_text = g_strdup_printf("%.1f / %.1fs", cursor_frames / (double)rate, total_frames / (double)rate);
-  gtk_label_set_text(GTK_LABEL(r->widgets.time_label), time_text);
+  if (r->platform.ui && r->platform.ui->set_time_text) {
+    r->platform.ui->set_time_text(r->platform.backend.user_data, time_text);
+  }
   g_free(time_text);
 }
 
@@ -227,7 +265,9 @@ static void refresh_ui(Recorder *r) {
 
   seconds = (double)frames / (double)rate;
   status = core_build_status_state(mode, seconds, error, loop_enabled, loop_region_set);
-  gtk_label_set_text(GTK_LABEL(r->widgets.status_label), status.text);
+  if (r->platform.ui && r->platform.ui->set_status_text) {
+    r->platform.ui->set_status_text(r->platform.backend.user_data, status.text);
+  }
 
   {
     update_time_label(r);
@@ -241,7 +281,9 @@ static void refresh_ui(Recorder *r) {
   if (r->loop_toggled_handler_id != 0) {
     g_signal_handler_unblock(r->widgets.loop_button, r->loop_toggled_handler_id);
   }
-  gtk_widget_queue_draw(r->widgets.waveform_base);
+  if (r->platform.ui && r->platform.ui->queue_waveform_redraw) {
+    r->platform.ui->queue_waveform_redraw(r->platform.backend.user_data);
+  }
 
   {
     gint width = gtk_widget_get_allocated_width(r->widgets.waveform_base);
@@ -296,56 +338,15 @@ static void seek_to_fraction(Recorder *r, double fraction) {
   g_mutex_unlock(&r->mutex);
 
   if (mode == MODE_PLAYING && !scrubbing) {
-    stop_playback_thread(r, FALSE);
-    if (!start_playback_thread(r)) {
+    if (r->platform.audio && r->platform.audio->stop_playback) {
+      r->platform.audio->stop_playback(r->platform.backend.user_data, FALSE);
+    }
+    if (!r->platform.audio || !r->platform.audio->start_playback || !r->platform.audio->start_playback(r->platform.backend.user_data)) {
       return;
     }
   } else {
     refresh_ui(r);
   }
-}
-
-static gboolean grab_scrub_pointer(GtkWidget *widget, GdkEventButton *event) {
-  GdkWindow *window = gtk_widget_get_window(widget);
-  GdkDevice *device = gdk_event_get_device((GdkEvent *)event);
-  GdkSeat *seat;
-
-  if (!window || !device) {
-    return FALSE;
-  }
-
-  seat = gdk_device_get_seat(device);
-  if (!seat) {
-    return FALSE;
-  }
-
-  return gdk_seat_grab(seat,
-                       window,
-                       GDK_SEAT_CAPABILITY_POINTER,
-                       FALSE,
-                       NULL,
-                       (GdkEvent *)event,
-                       NULL,
-                       NULL) == GDK_GRAB_SUCCESS;
-}
-
-static void release_scrub_pointer(GtkWidget *widget, GdkEventButton *event) {
-  GdkWindow *window = gtk_widget_get_window(widget);
-  GdkDevice *device = gdk_event_get_device((GdkEvent *)event);
-  GdkSeat *seat;
-
-  (void)window;
-
-  if (!device) {
-    return;
-  }
-
-  seat = gdk_device_get_seat(device);
-  if (!seat) {
-    return;
-  }
-
-  gdk_seat_ungrab(seat);
 }
 
 static void begin_scrub(Recorder *r) {
@@ -366,8 +367,8 @@ static void begin_scrub(Recorder *r) {
   g_mutex_unlock(&r->mutex);
 
   g_printerr("[scrub] begin resume=%d\n", was_playing ? 1 : 0);
-  if (was_playing) {
-    stop_playback_thread(r, FALSE);
+  if (was_playing && r->platform.audio && r->platform.audio->stop_playback) {
+    r->platform.audio->stop_playback(r->platform.backend.user_data, FALSE);
   }
 }
 
@@ -392,7 +393,9 @@ static void update_scrub(Recorder *r, double fraction) {
 
   g_printerr("[scrub] fraction=%.3f target_frames=%.1f mode=%d\n", fraction, target_frames, mode);
   update_time_label(r);
-  gtk_widget_queue_draw(r->widgets.waveform_base);
+  if (r->platform.ui && r->platform.ui->queue_waveform_redraw) {
+    r->platform.ui->queue_waveform_redraw(r->platform.backend.user_data);
+  }
 }
 
 static void end_scrub(Recorder *r) {
@@ -410,7 +413,9 @@ static void end_scrub(Recorder *r) {
 
   g_printerr("[scrub] end resume=%d\n", resume ? 1 : 0);
   if (resume) {
-    start_playback_thread(r);
+    if (r->platform.audio && r->platform.audio->start_playback) {
+      r->platform.audio->start_playback(r->platform.backend.user_data);
+    }
   }
 }
 
@@ -446,6 +451,19 @@ static LoopSnapshot get_loop_snapshot(Recorder *r) {
   g_mutex_unlock(&r->mutex);
 
   return snapshot;
+}
+
+static PlatformLoopSnapshot get_platform_loop_snapshot(Recorder *r) {
+  LoopSnapshot snapshot = get_loop_snapshot(r);
+  PlatformLoopSnapshot platform_snapshot = {0};
+
+  platform_snapshot.enabled = snapshot.enabled;
+  platform_snapshot.explicit_region_set = snapshot.explicit_region_set;
+  platform_snapshot.effective_region_set = snapshot.effective_region_set;
+  platform_snapshot.total_frames = snapshot.total_frames;
+  platform_snapshot.start_frames = snapshot.start_frames;
+  platform_snapshot.end_frames = snapshot.end_frames;
+  return platform_snapshot;
 }
 
 static void finalize_loop_region(Recorder *r, gdouble start_frames, gdouble end_frames) {
@@ -495,7 +513,9 @@ static gboolean playhead_tick_cb(GtkWidget *widget, GdkFrameClock *frame_clock, 
   }
 
   update_time_label(r);
-  gtk_widget_queue_draw(r->widgets.waveform_base);
+  if (r->platform.ui && r->platform.ui->queue_waveform_redraw) {
+    r->platform.ui->queue_waveform_redraw(r->platform.backend.user_data);
+  }
   return G_SOURCE_CONTINUE;
 }
 
@@ -711,7 +731,9 @@ static gboolean render_progress_tick_cb(gpointer data) {
     }
   }
 
-  gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(r->widgets.progress_bar), progress);
+  if (r->platform.ui && r->platform.ui->set_progress_fraction) {
+    r->platform.ui->set_progress_fraction(r->platform.backend.user_data, progress);
+  }
   return TRUE;
 }
 
@@ -748,7 +770,9 @@ static gboolean render_completion_idle_cb(gpointer data) {
     return FALSE;
   }
 
-  gtk_widget_hide(r->widgets.progress_bar);
+  if (r->platform.ui && r->platform.ui->set_progress_visible) {
+    r->platform.ui->set_progress_visible(r->platform.backend.user_data, FALSE);
+  }
 
   if (completion->outcome == RENDER_OUTCOME_FAILED) {
     set_error(r, completion->error);
@@ -943,8 +967,12 @@ static gboolean ensure_playback_buffer(Recorder *r) {
   r->mode = MODE_RENDERING;
   g_mutex_unlock(&r->mutex);
 
-  gtk_widget_show(r->widgets.progress_bar);
-  gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(r->widgets.progress_bar), 0.0);
+  if (r->platform.ui && r->platform.ui->set_progress_visible) {
+    r->platform.ui->set_progress_visible(r->platform.backend.user_data, TRUE);
+  }
+  if (r->platform.ui && r->platform.ui->set_progress_fraction) {
+    r->platform.ui->set_progress_fraction(r->platform.backend.user_data, 0.0);
+  }
   clear_error(r);
   g_printerr("[render] starting async render thread\n");
   {
@@ -983,6 +1011,10 @@ static gboolean start_playback_with_ready_buffer(Recorder *r) {
   clear_error(r);
 
   g_printerr("[ui] starting playback thread\n");
+  if (r->platform.audio && r->platform.audio->start_playback) {
+    return r->platform.audio->start_playback(r->platform.backend.user_data);
+  }
+
   r->playback_thread = g_thread_new("pulse-playback", playback_thread_main, r);
   return TRUE;
 }
@@ -1740,13 +1772,19 @@ static void transport_stop(Recorder *r) {
 
   if (render_thread) {
     g_thread_unref(render_thread);
-    gtk_widget_hide(r->widgets.progress_bar);
+    if (r->platform.ui && r->platform.ui->set_progress_visible) {
+      r->platform.ui->set_progress_visible(r->platform.backend.user_data, FALSE);
+    }
   } else {
     if (plan.should_stop_playback) {
-      stop_playback_thread(r, !plan.preserve_cursor);
+      if (r->platform.audio && r->platform.audio->stop_playback) {
+        r->platform.audio->stop_playback(r->platform.backend.user_data, !plan.preserve_cursor);
+      }
     }
     if (plan.should_stop_capture) {
-      stop_capture_thread(r, FALSE);
+      if (r->platform.audio && r->platform.audio->stop_capture) {
+        r->platform.audio->stop_capture(r->platform.backend.user_data, FALSE);
+      }
     }
     set_mode(r, plan.next_mode);
   }
@@ -1766,15 +1804,19 @@ static void transport_start_recording(Recorder *r) {
 
   if (render_thread) {
     g_thread_unref(render_thread);
-    gtk_widget_hide(r->widgets.progress_bar);
+    if (r->platform.ui && r->platform.ui->set_progress_visible) {
+      r->platform.ui->set_progress_visible(r->platform.backend.user_data, FALSE);
+    }
   }
 
   if (plan.should_start) {
     g_printerr("[ui] record clicked: starting\n");
     if (plan.should_stop_playback) {
-      stop_playback_thread(r, TRUE);
+      if (r->platform.audio && r->platform.audio->stop_playback) {
+        r->platform.audio->stop_playback(r->platform.backend.user_data, TRUE);
+      }
     }
-    if (!start_capture_thread(r, plan.reset_buffers)) {
+    if (!r->platform.audio || !r->platform.audio->start_capture || !r->platform.audio->start_capture(r->platform.backend.user_data, plan.reset_buffers)) {
       set_error(r, "Failed to start capture thread");
     }
     set_mode(r, plan.next_mode);
@@ -1790,12 +1832,16 @@ static gboolean transport_play_from_idle(Recorder *r) {
   preserved_cursor = get_idle_resume_cursor_locked(r);
   g_mutex_unlock(&r->mutex);
 
-  stop_capture_thread(r, FALSE);
+  if (r->platform.audio && r->platform.audio->stop_capture) {
+    r->platform.audio->stop_capture(r->platform.backend.user_data, FALSE);
+  }
 
   g_mutex_lock(&r->mutex);
   set_playback_cursor_locked(r, preserved_cursor);
   g_mutex_unlock(&r->mutex);
-  return start_playback_thread(r);
+  return r->platform.audio && r->platform.audio->start_playback
+    ? r->platform.audio->start_playback(r->platform.backend.user_data)
+    : start_playback_thread(r);
 }
 
 static void transport_pause(Recorder *r) {
@@ -1808,7 +1854,9 @@ static void transport_pause(Recorder *r) {
   g_printerr("[ui] playback paused\n");
   g_mutex_unlock(&r->mutex);
 
-  stop_playback_thread(r, FALSE);
+  if (r->platform.audio && r->platform.audio->stop_playback) {
+    r->platform.audio->stop_playback(r->platform.backend.user_data, FALSE);
+  }
 }
 
 static void transport_resume(Recorder *r) {
@@ -1820,9 +1868,9 @@ static void transport_resume(Recorder *r) {
   g_printerr("[ui] playback resumed\n");
   g_mutex_unlock(&r->mutex);
 
-  if (!start_playback_thread(r)) {
-    set_error(r, "Failed to resume playback");
-  }
+    if (!r->platform.audio || !r->platform.audio->start_playback || !r->platform.audio->start_playback(r->platform.backend.user_data)) {
+      set_error(r, "Failed to resume playback");
+    }
 }
 
 static void transport_set_speed(Recorder *r, gdouble speed) {
@@ -1868,8 +1916,10 @@ static void transport_set_speed(Recorder *r, gdouble speed) {
   }
 
   if (restart_playback) {
-    stop_playback_thread(r, FALSE);
-    if (!start_playback_thread(r)) {
+    if (r->platform.audio && r->platform.audio->stop_playback) {
+      r->platform.audio->stop_playback(r->platform.backend.user_data, FALSE);
+    }
+    if (!r->platform.audio || !r->platform.audio->start_playback || !r->platform.audio->start_playback(r->platform.backend.user_data)) {
       set_error(r, "Failed to restart playback at new speed");
       refresh_ui(r);
     }
@@ -1968,111 +2018,10 @@ static guint16 *copy_wave_peaks(Recorder *r, gsize *peak_count) {
   return peaks;
 }
 
-static void draw_waveform_background(cairo_t *cr, double width, double height) {
-  const double mid_y = height * 0.5;
-
-  cairo_set_source_rgb(cr, 0.10, 0.10, 0.12);
-  cairo_paint(cr);
-
-  cairo_set_source_rgb(cr, 0.18, 0.18, 0.22);
-  cairo_set_line_width(cr, 1.0);
-  cairo_move_to(cr, 0, mid_y);
-  cairo_line_to(cr, width, mid_y);
-  cairo_stroke(cr);
-}
-
-static void draw_waveform_empty(cairo_t *cr, double width, double height) {
-  cairo_text_extents_t extents;
-  const char *text = "Waveform appears as you record";
-
-  cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 0.65);
-  cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
-  cairo_set_font_size(cr, 18.0);
-  cairo_text_extents(cr, text, &extents);
-  cairo_move_to(cr, (width - extents.width) * 0.5 - extents.x_bearing, (height - extents.height) * 0.5 - extents.y_bearing);
-  cairo_show_text(cr, text);
-}
-
-static void draw_waveform_peaks(cairo_t *cr, const guint16 *peaks, gsize peak_count, double width, double height) {
-  const double mid_y = height * 0.5;
-
-  cairo_set_source_rgb(cr, 0.35, 0.75, 0.50);
-  cairo_set_line_width(cr, 2.0);
-
-  for (int x = 0; x < (int)width; x++) {
-    gsize peak_idx = (gsize)x * peak_count / (gsize)width;
-    if (peak_idx >= peak_count) {
-      peak_idx = peak_count - 1;
-    }
-
-    double amp = (double)peaks[peak_idx] / 32768.0;
-    double top = mid_y - (amp * (height * 0.42));
-    double bottom = mid_y + (amp * (height * 0.42));
-    cairo_move_to(cr, x + 0.5, top);
-    cairo_line_to(cr, x + 0.5, bottom);
-  }
-
-  cairo_stroke(cr);
-}
-
-static void draw_loop_region(cairo_t *cr, const LoopSnapshot *loop, double width, double height) {
-  const gboolean active = loop->enabled || loop->explicit_region_set;
-  const double alpha = active ? 0.22 : 0.08;
-  const double color = active ? 0.45 : 0.55;
-  double start_x;
-  double end_x;
-
-  if (!loop->effective_region_set || loop->total_frames <= 0.0) {
-    return;
-  }
-
-  start_x = (loop->start_frames / loop->total_frames) * width;
-  end_x = (loop->end_frames / loop->total_frames) * width;
-
-  cairo_set_source_rgba(cr, color, color, color, alpha);
-  cairo_rectangle(cr, start_x, 0, MAX(end_x - start_x, 0.0), height);
-  cairo_fill(cr);
-
-  cairo_set_source_rgba(cr, color, color, color, active ? 0.55 : 0.20);
-  cairo_set_line_width(cr, 3.0);
-  cairo_move_to(cr, start_x + 0.5, 0);
-  cairo_line_to(cr, start_x + 0.5, height);
-  cairo_move_to(cr, end_x + 0.5, 0);
-  cairo_line_to(cr, end_x + 0.5, height);
-  cairo_stroke(cr);
-
-  cairo_set_source_rgba(cr, color, color, color, active ? 0.9 : 0.35);
-  cairo_move_to(cr, start_x - 7.0, 2.0);
-  cairo_line_to(cr, start_x + 7.0, 2.0);
-  cairo_line_to(cr, start_x, 13.0);
-  cairo_close_path(cr);
-  cairo_fill(cr);
-
-  cairo_move_to(cr, end_x - 7.0, 2.0);
-  cairo_line_to(cr, end_x + 7.0, 2.0);
-  cairo_line_to(cr, end_x, 13.0);
-  cairo_close_path(cr);
-  cairo_fill(cr);
-}
-
-static void draw_playhead(cairo_t *cr, double playhead_ratio, double width, double height) {
-  double playhead_x = playhead_ratio * width;
-
-  cairo_set_source_rgba(cr, 1.0, 0.55, 0.0, 0.16);
-  cairo_rectangle(cr, 0, 0, playhead_x, height);
-  cairo_fill(cr);
-
-  cairo_set_source_rgb(cr, 1.0, 0.55, 0.0);
-  cairo_set_line_width(cr, 3.0);
-  cairo_move_to(cr, playhead_x + 0.5, 0);
-  cairo_line_to(cr, playhead_x + 0.5, height);
-  cairo_stroke(cr);
-}
-
 static gboolean on_waveform_base_draw(GtkWidget *widget, cairo_t *cr, gpointer user_data) {
   Recorder *r = user_data;
   GtkAllocation allocation;
-  LoopSnapshot loop;
+  PlatformLoopSnapshot loop;
   guint16 *peaks = NULL;
   gsize peak_count = 0;
   double width;
@@ -2081,22 +2030,21 @@ static gboolean on_waveform_base_draw(GtkWidget *widget, cairo_t *cr, gpointer u
   gtk_widget_get_allocation(widget, &allocation);
   width = allocation.width;
   height = allocation.height;
-  loop = get_loop_snapshot(r);
+  loop = get_platform_loop_snapshot(r);
   peaks = copy_wave_peaks(r, &peak_count);
 
-  draw_waveform_background(cr, width, height);
-
-  if (peak_count == 0 || width <= 1.0) {
-    draw_waveform_empty(cr, width, height);
-    g_free(peaks);
-    return FALSE;
+  if (r->platform.ui && r->platform.ui->draw_waveform) {
+    r->platform.ui->draw_waveform(r->platform.backend.user_data,
+                                  cr,
+                                  width,
+                                  height,
+                                  peaks,
+                                  peak_count,
+                                  &loop,
+                                  get_playhead_ratio(r));
   }
 
-  draw_waveform_peaks(cr, peaks, peak_count, width, height);
   g_free(peaks);
-
-  draw_loop_region(cr, &loop, width, height);
-  draw_playhead(cr, get_playhead_ratio(r), width, height);
 
   return FALSE;
 }
@@ -2134,7 +2082,9 @@ static gboolean on_waveform_button_press(GtkWidget *widget, GdkEventButton *even
     r->render_intent.seek_pos = seek_frames;
     g_mutex_unlock(&r->mutex);
     update_time_label(r);
-    gtk_widget_queue_draw(r->widgets.waveform_base);
+    if (r->platform.ui && r->platform.ui->queue_waveform_redraw) {
+      r->platform.ui->queue_waveform_redraw(r->platform.backend.user_data);
+    }
     refresh_ui(r);
     return TRUE;
   }
@@ -2146,10 +2096,12 @@ static gboolean on_waveform_button_press(GtkWidget *widget, GdkEventButton *even
 
   if (shift && total_frames > 0.0) {
     set_loop_drag(r, LOOP_DRAG_CREATE, target_frames, 0.0);
-    if (!grab_scrub_pointer(widget, event)) {
+    if (!r->platform.ui || !r->platform.ui->grab_pointer || !r->platform.ui->grab_pointer(r->platform.backend.user_data, widget, event)) {
       g_printerr("[loop] pointer grab failed\n");
     }
-    gtk_widget_queue_draw(r->widgets.waveform_base);
+    if (r->platform.ui && r->platform.ui->queue_waveform_redraw) {
+      r->platform.ui->queue_waveform_redraw(r->platform.backend.user_data);
+    }
     return TRUE;
   }
 
@@ -2159,7 +2111,7 @@ static gboolean on_waveform_button_press(GtkWidget *widget, GdkEventButton *even
 
     if (near_start) {
       set_loop_drag(r, LOOP_DRAG_START, 0.0, 0.0);
-      if (!grab_scrub_pointer(widget, event)) {
+      if (!r->platform.ui || !r->platform.ui->grab_pointer || !r->platform.ui->grab_pointer(r->platform.backend.user_data, widget, event)) {
         g_printerr("[loop] pointer grab failed\n");
       }
       return TRUE;
@@ -2167,7 +2119,7 @@ static gboolean on_waveform_button_press(GtkWidget *widget, GdkEventButton *even
 
     if (near_end) {
       set_loop_drag(r, LOOP_DRAG_END, 0.0, 0.0);
-      if (!grab_scrub_pointer(widget, event)) {
+      if (!r->platform.ui || !r->platform.ui->grab_pointer || !r->platform.ui->grab_pointer(r->platform.backend.user_data, widget, event)) {
         g_printerr("[loop] pointer grab failed\n");
       }
       return TRUE;
@@ -2175,7 +2127,7 @@ static gboolean on_waveform_button_press(GtkWidget *widget, GdkEventButton *even
   }
 
   begin_scrub(r);
-  if (!grab_scrub_pointer(widget, event)) {
+  if (!r->platform.ui || !r->platform.ui->grab_pointer || !r->platform.ui->grab_pointer(r->platform.backend.user_data, widget, event)) {
     g_printerr("[scrub] pointer grab failed\n");
   }
   if (total_frames > 0.0) {
@@ -2198,7 +2150,9 @@ static gboolean on_waveform_button_release(GtkWidget *widget, GdkEventButton *ev
     return FALSE;
   }
 
-  release_scrub_pointer(widget, event);
+  if (r->platform.ui && r->platform.ui->release_pointer) {
+    r->platform.ui->release_pointer(r->platform.backend.user_data, widget, event);
+  }
 
   g_mutex_lock(&r->mutex);
   drag_mode = r->loop.drag_mode;
@@ -2235,7 +2189,9 @@ static gboolean on_waveform_button_release(GtkWidget *widget, GdkEventButton *ev
 
     clear_loop_drag(r);
     refresh_ui(r);
-    gtk_widget_queue_draw(r->widgets.waveform_base);
+    if (r->platform.ui && r->platform.ui->queue_waveform_redraw) {
+      r->platform.ui->queue_waveform_redraw(r->platform.backend.user_data);
+    }
 
     return TRUE;
   }
@@ -2296,7 +2252,9 @@ static gboolean on_waveform_motion(GtkWidget *widget, GdkEventMotion *event, gpo
         break;
     }
 
-    gtk_widget_queue_draw(r->widgets.waveform_base);
+    if (r->platform.ui && r->platform.ui->queue_waveform_redraw) {
+      r->platform.ui->queue_waveform_redraw(r->platform.backend.user_data);
+    }
     return TRUE;
   }
 
@@ -2322,8 +2280,12 @@ static void on_window_destroy(GtkWidget *widget, gpointer user_data) {
     gtk_widget_remove_tick_callback(r->widgets.waveform_base, r->tick_callback_id);
   }
 
-  stop_playback_thread(r, TRUE);
-  stop_capture_thread(r, TRUE);
+  if (r->platform.audio && r->platform.audio->stop_playback) {
+    r->platform.audio->stop_playback(r->platform.backend.user_data, TRUE);
+  }
+  if (r->platform.audio && r->platform.audio->stop_capture) {
+    r->platform.audio->stop_capture(r->platform.backend.user_data, TRUE);
+  }
 
   g_mutex_clear(&r->mutex);
   if (r->audio.pcm) {
@@ -2371,6 +2333,17 @@ static void activate(GtkApplication *app, gpointer user_data) {
   r->widgets.play_pause_button = play_pause_button;
   r->widgets.loop_button = loop_button;
   r->widgets.stop_button = stop_button;
+  r->linux_ui.status_label = status;
+  r->linux_ui.speed_value_label = speed_value;
+  r->linux_ui.time_label = time_label;
+  r->linux_ui.waveform_base = waveform_base;
+  r->linux_ui.record_button = record_button;
+  r->linux_ui.play_pause_button = play_pause_button;
+  r->linux_ui.loop_button = loop_button;
+  r->linux_ui.stop_button = stop_button;
+  r->linux_ui.progress_bar = progress_bar;
+  r->platform = platform_linux_build(&r->linux_ui);
+  r->platform.audio = &linux_audio_vtable;
   r->audio.sample_rate = 44100;
   r->audio.channels = 2;
   r->audio.pcm = g_byte_array_new();

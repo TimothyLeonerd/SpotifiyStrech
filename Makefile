@@ -23,11 +23,14 @@ $(RUBBERBAND_LIB): $(RUBBERBAND_BUILD)/build.ninja
 core.o: core.c core.h
 	$(CC) $(CFLAGS) $(GTK_CFLAGS) $(PULSE_CFLAGS) -c -o $@ $<
 
+platform_linux.o: platform_linux.c platform_linux.h platform.h
+	$(CC) $(CFLAGS) $(GTK_CFLAGS) -c -o $@ $<
+
 app.o: app.c core.h $(RUBBERBAND_LIB)
 	$(CC) $(CFLAGS) $(GTK_CFLAGS) $(PULSE_CFLAGS) $(RUBBERBAND_CFLAGS) -c -o $@ $<
 
-$(TARGET): core.o app.o $(RUBBERBAND_LIB)
-	$(CXX) -o $@ core.o app.o $(RUBBERBAND_LIB) $(GTK_LIBS) $(PULSE_LIBS) -lm -pthread
+$(TARGET): core.o platform_linux.o app.o $(RUBBERBAND_LIB)
+	$(CXX) -o $@ core.o platform_linux.o app.o $(RUBBERBAND_LIB) $(GTK_LIBS) $(PULSE_LIBS) -lm -pthread
 
 clean:
 	rm -f $(TARGET) *.o *.wav
