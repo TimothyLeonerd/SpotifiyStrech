@@ -19,6 +19,7 @@ else()
 endif()
 
 add_executable(spotify-recorder-qt
+  recorder_controller.cpp
   qt_main.cpp
   qt_recorder_window.cpp
 )

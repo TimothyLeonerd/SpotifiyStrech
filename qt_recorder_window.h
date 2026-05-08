@@ -3,6 +3,8 @@
 #include <QMainWindow>
 #include <QVector>
 
+#include "recorder_controller.h"
+
 class QPaintEvent;
 
 class QLabel;
@@ -39,6 +41,8 @@ class RecorderWindow : public QMainWindow {
   void refreshWaveform();
   void updateSpeedLabel();
   void updatePlayPauseLabel();
+  void syncFromController();
+  void setDefaultLoopRegion();
 
   QWidget *central_ = nullptr;
   QLabel *title_ = nullptr;
@@ -52,7 +56,5 @@ class RecorderWindow : public QMainWindow {
   QSlider *speed_slider_ = nullptr;
   QProgressBar *progress_bar_ = nullptr;
   WaveformWidget *waveform_ = nullptr;
-  bool playing_ = false;
-  bool loop_enabled_ = false;
-  double speed_ = 1.0;
+  RecorderController controller_;
 };

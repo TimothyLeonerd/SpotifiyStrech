@@ -1,6 +1,5 @@
 #include "qt_recorder_window.h"
 
-#include <QApplication>
 #include <QBoxLayout>
 #include <QColor>
 #include <QLabel>
@@ -10,7 +9,6 @@
 #include <QProgressBar>
 #include <QPushButton>
 #include <QSlider>
-#include <QStyleFactory>
 #include <QTimer>
 
 #include <cmath>
@@ -140,7 +138,7 @@ RecorderWindow::RecorderWindow(QWidget *parent) : QMainWindow(parent) {
 
   waveform_ = new WaveformWidget(central_);
   waveform_->setPeaks(buildDemoPeaks());
-  waveform_->setLoopRegion(0.2, 0.58, false);
+  setDefaultLoopRegion();
 
   time_label_ = new QLabel(QStringLiteral("0.0 / 0.0s"), central_);
   status_label_ = new QLabel(QStringLiteral("Stopped | 0.0s captured"), central_);
@@ -170,57 +168,42 @@ RecorderWindow::RecorderWindow(QWidget *parent) : QMainWindow(parent) {
   setStyleSheet(dark_css);
 
   connect(record_button_, &QPushButton::clicked, this, [this]() {
-    playing_ = false;
-    updatePlayPauseLabel();
-    status_label_->setText(QStringLiteral("Recording | 0.0s captured"));
-    progress_bar_->setVisible(true);
-    progress_bar_->setValue(0);
-    waveform_->setLoopRegion(0.2, 0.58, loop_enabled_);
+    controller_.record();
+    syncFromController();
   });
 
   connect(stop_button_, &QPushButton::clicked, this, [this]() {
-    playing_ = false;
-    updatePlayPauseLabel();
-    status_label_->setText(QStringLiteral("Stopped | 0.0s captured"));
-    progress_bar_->setVisible(false);
-    waveform_->setPlayheadRatio(0.0);
+    controller_.stop();
+    syncFromController();
   });
 
   connect(play_pause_button_, &QPushButton::clicked, this, [this]() {
-    playing_ = !playing_;
-    updatePlayPauseLabel();
-    status_label_->setText(playing_ ? QStringLiteral("Playing | 0.0s captured")
-                                    : QStringLiteral("Paused | 0.0s captured"));
+    controller_.playPause();
+    syncFromController();
   });
 
   connect(loop_button_, &QPushButton::toggled, this, [this](bool checked) {
-    loop_enabled_ = checked;
-    waveform_->setLoopRegion(0.2, 0.58, loop_enabled_);
-    status_label_->setText(checked ? QStringLiteral("Loop on | 0.0s captured")
-                                   : QStringLiteral("Loop off | 0.0s captured"));
+    controller_.toggleLoop(checked);
+    setDefaultLoopRegion();
+    syncFromController();
   });
 
   connect(speed_slider_, &QSlider::valueChanged, this, [this](int value) {
-    speed_ = value / 100.0;
-    updateSpeedLabel();
+    controller_.setSpeed(value / 100.0);
+    syncFromController();
   });
 
   auto *ticker = new QTimer(this);
   ticker->setInterval(33);
   connect(ticker, &QTimer::timeout, this, [this]() {
-    static double phase = 0.0;
-    phase += playing_ ? 0.0045 * speed_ : 0.001;
-    if (phase > 1.0) phase -= 1.0;
-    waveform_->setPlayheadRatio(phase);
-    if (playing_) {
-      progress_bar_->setVisible(true);
-      progress_bar_->setValue(static_cast<int>(phase * 1000.0));
-    }
+    controller_.tick(0.033);
+    syncFromController();
   });
   ticker->start();
 
-  updateSpeedLabel();
-  updatePlayPauseLabel();
+  controller_.setCapturedFrames(0.0);
+  setDefaultLoopRegion();
+  syncFromController();
 }
 
 QVector<int> RecorderWindow::buildDemoPeaks() const {
@@ -240,9 +223,36 @@ void RecorderWindow::refreshWaveform() {
 }
 
 void RecorderWindow::updateSpeedLabel() {
-  speed_value_label_->setText(QString::number(speed_, 'f', 1) + QStringLiteral("x"));
+  speed_value_label_->setText(QString::number(controller_.speed(), 'f', 1) + QStringLiteral("x"));
 }
 
 void RecorderWindow::updatePlayPauseLabel() {
-  play_pause_button_->setText(playing_ ? QStringLiteral("Pause") : QStringLiteral("Play"));
+  play_pause_button_->setText(controller_.uiState().play_pause_label.empty()
+                                ? QStringLiteral("Play")
+                                : QString::fromStdString(controller_.uiState().play_pause_label));
+}
+
+void RecorderWindow::setDefaultLoopRegion() {
+  controller_.setLoopRegion(0.2, 0.58, controller_.loopEnabled());
+}
+
+void RecorderWindow::syncFromController() {
+  const auto ui = controller_.uiState();
+  const auto status = controller_.statusState();
+
+  record_button_->setEnabled(ui.record_enabled);
+  play_pause_button_->setEnabled(ui.play_pause_enabled);
+  loop_button_->setEnabled(ui.loop_enabled);
+  stop_button_->setEnabled(ui.stop_enabled);
+  progress_bar_->setVisible(controller_.mode() != RecorderMode::Idle);
+  status_label_->setText(QString::fromStdString(status.text));
+  const double total_seconds = controller_.capturedSeconds();
+  const double play_seconds = controller_.playheadRatio() * total_seconds;
+  time_label_->setText(QString::number(play_seconds, 'f', 1) + QStringLiteral(" / ") + QString::number(total_seconds, 'f', 1) + QStringLiteral("s"));
+  speed_value_label_->setText(QString::number(controller_.speed(), 'f', 1) + QStringLiteral("x"));
+  play_pause_button_->setText(QString::fromStdString(ui.play_pause_label));
+  loop_button_->setChecked(controller_.loopEnabled());
+  waveform_->setLoopRegion(controller_.loopStartRatio(), controller_.loopEndRatio(), controller_.loopEnabled());
+  waveform_->setPlayheadRatio(controller_.playheadRatio());
+  waveform_->update();
 }
