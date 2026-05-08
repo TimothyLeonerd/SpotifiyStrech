@@ -249,11 +249,7 @@ RecorderWindow::RecorderWindow(QWidget *parent) : QMainWindow(parent) {
         controller_.stop();
       } else if (windows_audio_context_.adapters.audio->start_playback) {
         started = windows_audio_context_.adapters.audio->start_playback(windows_audio_context_.adapters.backend.audio_user_data) != 0;
-        if (started) {
-          controller_.playPause();
-        } else {
-          controller_.stop();
-        }
+        controller_.setMode(started ? RecorderMode::Playing : RecorderMode::Idle);
       }
     }
 #else
