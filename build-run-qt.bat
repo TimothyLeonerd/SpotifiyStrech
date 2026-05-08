@@ -2,7 +2,8 @@
 setlocal
 
 set "ROOT=%~dp0"
-set "BUILD_DIR=%ROOT%build"
+if "%ROOT:~-1%"=="\" set "ROOT=%ROOT:~0,-1%"
+set "BUILD_DIR=%ROOT%\build"
 set "QT_DIR=C:\Qt\6.6.3\msvc2019_64"
 set "EXE=%BUILD_DIR%\Release\spotify-recorder-qt.exe"
 
