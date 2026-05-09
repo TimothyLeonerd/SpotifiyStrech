@@ -1,5 +1,6 @@
 #include "windows_audio_backend.h"
 #include "windows_debug_log.h"
+#include "waveform_peaks.h"
 
 #ifdef _WIN32
 
@@ -29,6 +30,32 @@ static void windows_audio_debug(const char *message) {
   windows_debug_log(message);
 }
 
+static void windows_audio_debug_format(const char *prefix, const WAVEFORMATEX *format, size_t snapshot_len) {
+  char buffer[256];
+
+  if (!prefix) {
+    prefix = "format";
+  }
+
+  if (!format) {
+    wsprintfA(buffer, "%s: format=null snapshot=%lu", prefix, (unsigned long)snapshot_len);
+  } else {
+    wsprintfA(buffer,
+              "%s: snapshot=%lu rate=%lu block=%u avg=%lu channels=%u bits=%u tag=%u float=%d",
+              prefix,
+              (unsigned long)snapshot_len,
+              (unsigned long)format->nSamplesPerSec,
+              (unsigned int)format->nBlockAlign,
+              (unsigned long)format->nAvgBytesPerSec,
+              (unsigned int)format->nChannels,
+              (unsigned int)format->wBitsPerSample,
+              (unsigned int)format->wFormatTag,
+              windows_audio_format_is_float_impl(format));
+  }
+
+  windows_audio_debug(buffer);
+}
+
 static const GUID kCLSID_MMDeviceEnumerator = {0xbcde0395, 0xe52f, 0x467c, {0x8e, 0x3d, 0xc4, 0x57, 0x92, 0x91, 0x69, 0x2e}};
 static const GUID kIID_IMMDeviceEnumerator = {0xa95664d2, 0x9614, 0x4f35, {0xa7, 0x46, 0xde, 0x8d, 0xb6, 0x36, 0x17, 0xe6}};
 static const GUID kIID_IAudioClient = {0x1cb9ad4c, 0xdbfa, 0x4c32, {0xb1, 0x78, 0xc2, 0xf5, 0x68, 0xa7, 0x03, 0xb2}};
@@ -45,9 +72,15 @@ typedef struct {
   HANDLE playback_thread;
   BOOL capture_active;
   BOOL playback_active;
+  size_t playback_cursor_bytes;
+  size_t playback_total_bytes;
   BYTE *pcm;
   size_t pcm_len;
   size_t pcm_cap;
+  uint16_t *wave_peaks;
+  size_t wave_peak_len;
+  size_t wave_peak_cap;
+  uint64_t captured_frames;
   WAVEFORMATEX *wave_format;
 } WindowsAudioBackendState;
 
@@ -109,12 +142,100 @@ static int windows_audio_format_is_float_impl(const WAVEFORMATEX *format) {
   return 0;
 }
 
+static WaveformPcmFormat windows_audio_waveform_format(const WAVEFORMATEX *format) {
+  if (!format) {
+    return 0;
+  }
+
+  if (windows_audio_format_is_float_impl(format)) {
+    return WAVEFORM_PCM_FLOAT32LE;
+  }
+
+  if (format->wFormatTag == WAVE_FORMAT_PCM) {
+    switch (format->wBitsPerSample) {
+      case 8: return WAVEFORM_PCM_U8;
+      case 16: return WAVEFORM_PCM_S16LE;
+      case 24: return WAVEFORM_PCM_S24LE;
+      case 32: return WAVEFORM_PCM_S32LE;
+      default: return 0;
+    }
+  }
+
+  if (format->wFormatTag == WAVE_FORMAT_EXTENSIBLE && format->cbSize >= sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)) {
+    const WAVEFORMATEXTENSIBLE *ext = (const WAVEFORMATEXTENSIBLE *)format;
+    if (IsEqualGUID(&ext->SubFormat, &kKSDATAFORMAT_SUBTYPE_PCM)) {
+      switch (format->wBitsPerSample) {
+        case 8: return WAVEFORM_PCM_U8;
+        case 16: return WAVEFORM_PCM_S16LE;
+        case 24: return WAVEFORM_PCM_S24LE;
+        case 32: return WAVEFORM_PCM_S32LE;
+        default: return 0;
+      }
+    }
+  }
+
+  return 0;
+}
+
 static void windows_audio_reset_buffer_locked(WindowsAudioBackendState *state) {
   if (!state) {
     return;
   }
 
   state->pcm_len = 0;
+  state->wave_peak_len = 0;
+  state->captured_frames = 0;
+}
+
+static BOOL windows_audio_append_peak_locked(WindowsAudioBackendState *state, uint16_t peak) {
+  size_t needed;
+  uint16_t *new_peaks;
+
+  if (!state) {
+    return FALSE;
+  }
+
+  needed = state->wave_peak_len + 1;
+  if (needed > state->wave_peak_cap) {
+    size_t new_cap = state->wave_peak_cap ? state->wave_peak_cap : 1024;
+    while (new_cap < needed) {
+      new_cap *= 2;
+    }
+    new_peaks = (uint16_t *)realloc(state->wave_peaks, new_cap * sizeof(*new_peaks));
+    if (!new_peaks) {
+      return FALSE;
+    }
+    state->wave_peaks = new_peaks;
+    state->wave_peak_cap = new_cap;
+  }
+
+  state->wave_peaks[state->wave_peak_len++] = peak;
+  return TRUE;
+}
+
+static void windows_audio_append_peaks_for_buffer_locked(WindowsAudioBackendState *state,
+                                                         const BYTE *data,
+                                                         size_t bytes,
+                                                         const WAVEFORMATEX *format) {
+  const unsigned int channels = (format && format->nChannels > 0) ? format->nChannels : 2;
+  const WaveformPcmFormat waveform_format = windows_audio_waveform_format(format);
+  const unsigned int bytes_per_sample = waveform_pcm_bytes_per_sample(waveform_format);
+  const size_t frame_size = (size_t)channels * (size_t)bytes_per_sample;
+  const size_t chunk_frames = 256;
+  const size_t chunk_bytes = chunk_frames * frame_size;
+
+  if (!state || !data || bytes == 0 || frame_size == 0 || waveform_format == WAVEFORM_PCM_INVALID) {
+    return;
+  }
+
+  for (size_t offset = 0; offset < bytes; offset += chunk_bytes) {
+    const size_t remaining = bytes - offset;
+    const size_t this_bytes = remaining < chunk_bytes ? remaining : chunk_bytes;
+    const uint16_t peak = waveform_peak_from_pcm_chunk(data + offset, this_bytes, channels, waveform_format);
+    if (!windows_audio_append_peak_locked(state, peak)) {
+      return;
+    }
+  }
 }
 
 static BOOL windows_audio_append_locked(WindowsAudioBackendState *state, const BYTE *data, size_t bytes) {
@@ -203,26 +324,22 @@ static DWORD WINAPI windows_capture_thread(LPVOID param) {
   IAudioClient *client = NULL;
   IAudioCaptureClient *capture_client = NULL;
   WAVEFORMATEX *format = NULL;
+  WAVEFORMATEX *capture_format = NULL;
   UINT32 bytes_per_frame = 0;
   HANDLE mm_task = NULL;
   HRESULT hr;
 
   if (!state) {
-    windows_audio_debug("capture thread no state");
     return 1;
   }
 
-  windows_audio_debug("capture thread entered");
   CoInitializeEx(NULL, COINIT_MULTITHREADED);
 
-  windows_audio_debug("capture thread opening loopback device");
   hr = windows_audio_init_device_client(eRender, &client, &format);
   if (FAILED(hr) || !client || !format) {
-    windows_audio_debug("capture thread device init failed");
     goto cleanup;
   }
 
-  windows_audio_debug("capture thread initializing client");
   hr = IAudioClient_Initialize(client,
                                AUDCLNT_SHAREMODE_SHARED,
                                AUDCLNT_STREAMFLAGS_LOOPBACK,
@@ -231,34 +348,20 @@ static DWORD WINAPI windows_capture_thread(LPVOID param) {
                                format,
                                NULL);
   if (FAILED(hr)) {
-    windows_audio_debug("capture thread initialize failed");
     goto cleanup;
   }
-
-  windows_audio_debug("capture thread initialize succeeded");
 
   bytes_per_frame = format->nBlockAlign;
 
-  windows_audio_debug("capture thread getting service");
   hr = IAudioClient_GetService(client, &kIID_IAudioCaptureClient, (void **)&capture_client);
   if (FAILED(hr)) {
-    windows_audio_debug("capture thread get service failed");
     goto cleanup;
   }
 
-  windows_audio_debug("capture thread got service");
-
-  windows_audio_debug("capture thread setting mm task characteristics");
-  mm_task = NULL;
-  windows_audio_debug("capture thread skipping mm task characteristics");
-  windows_audio_debug("capture thread starting client");
   hr = IAudioClient_Start(client);
   if (FAILED(hr)) {
-    windows_audio_debug("capture thread start failed");
     goto cleanup;
   }
-
-  windows_audio_debug("capture thread start succeeded");
 
   EnterCriticalSection(&state->lock);
   windows_audio_reset_buffer_locked(state);
@@ -266,11 +369,10 @@ static DWORD WINAPI windows_capture_thread(LPVOID param) {
     windows_audio_free_format(state->wave_format);
   }
   state->wave_format = format;
+  capture_format = state->wave_format;
   format = NULL;
   state->capture_active = TRUE;
   LeaveCriticalSection(&state->lock);
-
-  windows_audio_debug("windows capture thread started");
 
   while (WaitForSingleObject(state->capture_stop_event, 10) == WAIT_TIMEOUT) {
     UINT32 packet_length = 0;
@@ -294,11 +396,17 @@ static DWORD WINAPI windows_capture_thread(LPVOID param) {
       if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
         BYTE *silence = (BYTE *)calloc(1, bytes);
         if (silence) {
-          windows_audio_append_locked(state, silence, bytes);
+          if (windows_audio_append_locked(state, silence, bytes)) {
+            windows_audio_append_peaks_for_buffer_locked(state, silence, bytes, capture_format);
+            state->captured_frames += frames;
+          }
           free(silence);
         }
       } else {
-        windows_audio_append_locked(state, data, bytes);
+        if (windows_audio_append_locked(state, data, bytes)) {
+          windows_audio_append_peaks_for_buffer_locked(state, data, bytes, capture_format);
+          state->captured_frames += frames;
+        }
       }
       LeaveCriticalSection(&state->lock);
 
@@ -330,7 +438,6 @@ cleanup:
   EnterCriticalSection(&state->lock);
   state->capture_active = FALSE;
   LeaveCriticalSection(&state->lock);
-  windows_audio_debug("windows capture thread stopped");
   CoUninitialize();
   return 0;
 }
@@ -340,19 +447,18 @@ static DWORD WINAPI windows_playback_thread(LPVOID param) {
   WindowsAudioBackendState *state = windows_audio_get_state(context, FALSE);
   IAudioClient *client = NULL;
   IAudioRenderClient *render_client = NULL;
-  WAVEFORMATEX *format = NULL;
+  WAVEFORMATEX *source_format = NULL;
+  WAVEFORMATEX *render_format = NULL;
   BYTE *snapshot = NULL;
   size_t snapshot_len = 0;
+  size_t cursor = 0;
   HRESULT hr;
 
   if (!state) {
     return 1;
   }
 
-  windows_audio_debug("windows playback thread starting");
-
   CoInitializeEx(NULL, COINIT_MULTITHREADED);
-  windows_audio_debug("playback thread initialized COM");
 
   EnterCriticalSection(&state->lock);
   if (state->pcm_len > 0) {
@@ -362,75 +468,75 @@ static DWORD WINAPI windows_playback_thread(LPVOID param) {
       snapshot_len = state->pcm_len;
     }
   }
-  format = state->wave_format;
-  if (format) {
-    format = (WAVEFORMATEX *)malloc(sizeof(WAVEFORMATEX) + format->cbSize);
-    if (format) {
-      memcpy(format, state->wave_format, sizeof(WAVEFORMATEX) + state->wave_format->cbSize);
+  source_format = state->wave_format;
+  if (source_format) {
+    source_format = (WAVEFORMATEX *)malloc(sizeof(WAVEFORMATEX) + source_format->cbSize);
+    if (source_format) {
+      memcpy(source_format, state->wave_format, sizeof(WAVEFORMATEX) + state->wave_format->cbSize);
     }
   }
   LeaveCriticalSection(&state->lock);
 
-  if (!snapshot || !format) {
-    windows_audio_debug("playback thread missing snapshot or format");
+  if (!snapshot || !source_format) {
     goto cleanup;
   }
 
-  windows_audio_debug("playback thread opening render device");
-  hr = windows_audio_init_device_client(eRender, &client, &format);
-  if (FAILED(hr) || !client || !format) {
-    windows_audio_debug("playback thread device init failed");
+  windows_audio_debug_format("playback source", source_format, snapshot_len);
+  {
+    const unsigned long source_ms = source_format->nAvgBytesPerSec > 0 ? (unsigned long)((1000.0 * (double)snapshot_len / (double)source_format->nAvgBytesPerSec) + 0.5) : 0UL;
+    char duration_message[160];
+    wsprintfA(duration_message, "playback source duration=%lu ms snapshot_bytes=%lu", source_ms, (unsigned long)snapshot_len);
+    windows_audio_debug(duration_message);
+  }
+
+  render_format = NULL;
+  hr = windows_audio_init_device_client(eRender, &client, &render_format);
+  if (FAILED(hr) || !client || !render_format) {
     goto cleanup;
   }
 
-  windows_audio_debug("playback thread initializing client");
+  windows_audio_debug_format("playback render", render_format, snapshot_len);
+  {
+    const unsigned long render_ms = render_format->nAvgBytesPerSec > 0 ? (unsigned long)((1000.0 * (double)snapshot_len / (double)render_format->nAvgBytesPerSec) + 0.5) : 0UL;
+    char duration_message[160];
+    wsprintfA(duration_message, "playback render duration=%lu ms snapshot_bytes=%lu", render_ms, (unsigned long)snapshot_len);
+    windows_audio_debug(duration_message);
+  }
+
   hr = IAudioClient_Initialize(client,
                                AUDCLNT_SHAREMODE_SHARED,
                                0,
                                10000000,
                                0,
-                               format,
+                               render_format,
                                NULL);
   if (FAILED(hr)) {
-    windows_audio_debug("playback thread initialize failed");
     goto cleanup;
   }
 
-  windows_audio_debug("playback thread initialize succeeded");
-
-  windows_audio_debug("playback thread getting render service");
   hr = IAudioClient_GetService(client, &kIID_IAudioRenderClient, (void **)&render_client);
   if (FAILED(hr)) {
-    windows_audio_debug("playback thread get service failed");
     goto cleanup;
   }
 
-  windows_audio_debug("playback thread got render service");
-
-  windows_audio_debug("playback thread starting client");
   hr = IAudioClient_Start(client);
   if (FAILED(hr)) {
-    windows_audio_debug("playback thread start failed");
     goto cleanup;
   }
-
-  windows_audio_debug("playback thread start succeeded");
 
   EnterCriticalSection(&state->lock);
   state->playback_active = TRUE;
+  state->playback_cursor_bytes = 0;
+  state->playback_total_bytes = snapshot_len;
   LeaveCriticalSection(&state->lock);
 
   {
     UINT32 buffer_frames = 0;
-    UINT32 bytes_per_frame = format->nBlockAlign;
-    size_t cursor = 0;
+    UINT32 bytes_per_frame = render_format->nBlockAlign;
 
     if (FAILED(IAudioClient_GetBufferSize(client, &buffer_frames))) {
-      windows_audio_debug("playback thread buffer size failed");
       goto cleanup;
     }
-
-    windows_audio_debug("playback thread entered render loop");
 
   while (WaitForSingleObject(state->playback_stop_event, 10) == WAIT_TIMEOUT) {
       UINT32 padding = 0;
@@ -438,7 +544,6 @@ static DWORD WINAPI windows_playback_thread(LPVOID param) {
       BYTE *render_data = NULL;
 
       if (FAILED(IAudioClient_GetCurrentPadding(client, &padding))) {
-        windows_audio_debug("playback thread current padding failed");
         break;
       }
       available = buffer_frames - padding;
@@ -447,7 +552,6 @@ static DWORD WINAPI windows_playback_thread(LPVOID param) {
       }
 
       if (FAILED(IAudioRenderClient_GetBuffer(render_client, available, &render_data))) {
-        windows_audio_debug("playback thread get buffer failed");
         break;
       }
 
@@ -465,8 +569,16 @@ static DWORD WINAPI windows_playback_thread(LPVOID param) {
       }
 
       IAudioRenderClient_ReleaseBuffer(render_client, available, 0);
+      EnterCriticalSection(&state->lock);
+      state->playback_cursor_bytes = cursor;
+      state->playback_total_bytes = snapshot_len;
+      LeaveCriticalSection(&state->lock);
       if (cursor >= snapshot_len) {
-        windows_audio_debug("playback thread reached end of snapshot");
+        {
+          char end_message[160];
+          wsprintfA(end_message, "playback exit cursor=%lu snapshot_bytes=%lu", (unsigned long)cursor, (unsigned long)snapshot_len);
+          windows_audio_debug(end_message);
+        }
         break;
       }
     }
@@ -483,13 +595,17 @@ cleanup:
     IAudioClient_Release(client);
   }
   free(snapshot);
-  if (format) {
-    free(format);
+  if (source_format) {
+    free(source_format);
+  }
+  if (render_format) {
+    free(render_format);
   }
   EnterCriticalSection(&state->lock);
+  state->playback_cursor_bytes = cursor;
+  state->playback_total_bytes = snapshot_len;
   state->playback_active = FALSE;
   LeaveCriticalSection(&state->lock);
-  windows_audio_debug("windows playback thread stopped");
   CoUninitialize();
   return 0;
 }
@@ -521,6 +637,9 @@ static gboolean windows_start_capture(void *user_data, gboolean reset_buffers) {
   EnterCriticalSection(&state->lock);
   if (reset_buffers) {
     windows_audio_reset_buffer_locked(state);
+    free(state->wave_peaks);
+    state->wave_peaks = NULL;
+    state->wave_peak_cap = 0;
   }
   if (state->capture_active) {
     LeaveCriticalSection(&state->lock);
@@ -529,7 +648,6 @@ static gboolean windows_start_capture(void *user_data, gboolean reset_buffers) {
   ResetEvent(state->capture_stop_event);
   state->capture_thread = CreateThread(NULL, 0, windows_capture_thread, context, 0, NULL);
   LeaveCriticalSection(&state->lock);
-  windows_audio_debug(state->capture_thread ? "capture thread created" : "capture thread create failed");
   return state->capture_thread != NULL;
 }
 
@@ -542,7 +660,6 @@ static void windows_stop_capture(void *user_data, gboolean force_stopped) {
   if (!state) {
     return;
   }
-  windows_audio_debug("stopping capture");
   windows_audio_signal_stop(state->capture_stop_event);
   windows_audio_join_thread(&state->capture_thread);
 }
@@ -556,7 +673,6 @@ static gboolean windows_start_playback(void *user_data) {
   }
 
   if (state->capture_active || state->capture_thread) {
-    windows_audio_debug("finalizing capture before playback");
     windows_stop_capture(user_data, TRUE);
   }
 
@@ -568,7 +684,6 @@ static gboolean windows_start_playback(void *user_data) {
   ResetEvent(state->playback_stop_event);
   state->playback_thread = CreateThread(NULL, 0, windows_playback_thread, context, 0, NULL);
   LeaveCriticalSection(&state->lock);
-  windows_audio_debug(state->playback_thread ? "playback thread created" : "playback thread create failed");
   return state->playback_thread != NULL;
 }
 
@@ -581,7 +696,7 @@ static void windows_stop_playback(void *user_data, gboolean reset_cursor) {
   if (!state) {
     return;
   }
-  windows_audio_debug("stopping playback");
+  windows_audio_debug("playback stop requested");
   windows_audio_signal_stop(state->playback_stop_event);
   windows_audio_join_thread(&state->playback_thread);
 }
@@ -630,11 +745,16 @@ int windows_audio_backend_format_is_float(const void *format_ptr) {
 }
 
 int windows_audio_backend_snapshot(void *user_data,
-                                  unsigned char **out_pcm,
-                                  size_t *out_pcm_len,
-                                  void **out_format,
-                                  int *out_capture_active,
-                                  int *out_playback_active) {
+                                   unsigned char **out_pcm,
+                                   size_t *out_pcm_len,
+                                   void **out_format,
+                                   int *out_capture_active,
+                                   int *out_playback_active,
+                                   size_t *out_playback_cursor_bytes,
+                                   size_t *out_playback_total_bytes,
+                                   uint16_t **out_wave_peaks,
+                                   size_t *out_wave_peak_count,
+                                   uint64_t *out_captured_frames) {
   PlatformWindowsContext *context = (PlatformWindowsContext *)user_data;
   WindowsAudioBackendState *state = windows_audio_get_state(context, FALSE);
 
@@ -652,6 +772,21 @@ int windows_audio_backend_snapshot(void *user_data,
   }
   if (out_playback_active) {
     *out_playback_active = 0;
+  }
+  if (out_playback_cursor_bytes) {
+    *out_playback_cursor_bytes = 0;
+  }
+  if (out_playback_total_bytes) {
+    *out_playback_total_bytes = 0;
+  }
+  if (out_captured_frames) {
+    *out_captured_frames = 0;
+  }
+  if (out_wave_peaks) {
+    *out_wave_peaks = NULL;
+  }
+  if (out_wave_peak_count) {
+    *out_wave_peak_count = 0;
   }
 
   if (!state) {
@@ -682,6 +817,25 @@ int windows_audio_backend_snapshot(void *user_data,
   if (out_playback_active) {
     *out_playback_active = state->playback_active;
   }
+  if (out_playback_cursor_bytes) {
+    *out_playback_cursor_bytes = state->playback_cursor_bytes;
+  }
+  if (out_playback_total_bytes) {
+    *out_playback_total_bytes = state->playback_total_bytes;
+  }
+  if (out_captured_frames) {
+    *out_captured_frames = state->captured_frames;
+  }
+  if (out_wave_peaks && state->wave_peaks && state->wave_peak_len > 0) {
+    uint16_t *copy = (uint16_t *)malloc(state->wave_peak_len * sizeof(*copy));
+    if (copy) {
+      memcpy(copy, state->wave_peaks, state->wave_peak_len * sizeof(*copy));
+      *out_wave_peaks = copy;
+      if (out_wave_peak_count) {
+        *out_wave_peak_count = state->wave_peak_len;
+      }
+    }
+  }
   LeaveCriticalSection(&state->lock);
 
   return 1;
@@ -704,6 +858,10 @@ void windows_audio_backend_destroy(void *user_data) {
   state->pcm = NULL;
   state->pcm_len = 0;
   state->pcm_cap = 0;
+  free(state->wave_peaks);
+  state->wave_peaks = NULL;
+  state->wave_peak_len = 0;
+  state->wave_peak_cap = 0;
   windows_audio_free_format(state->wave_format);
   state->wave_format = NULL;
   LeaveCriticalSection(&state->lock);

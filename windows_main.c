@@ -2,7 +2,6 @@
 
 #include "windows_audio_backend.h"
 #include "platform_windows_win32.h"
-#include "windows_debug_log.h"
 
 static void windows_host_command_dispatch(void *user_data, int command_id) {
   PlatformWindowsContext *context = (PlatformWindowsContext *)user_data;
@@ -53,13 +52,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev_instance, PWSTR command_l
   context.adapters.audio = windows_audio_backend_vtable();
   context.command_handler = windows_host_command_dispatch;
   context.command_handler_user_data = &context;
-  windows_debug_log("wWinMain entered");
   if (!platform_windows_host_init(&host, &context)) {
-    windows_debug_log("platform_windows_host_init failed");
     return 1;
   }
 
-  windows_debug_log("host initialized");
   return platform_windows_host_run(&host);
 }
 

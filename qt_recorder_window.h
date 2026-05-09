@@ -8,7 +8,6 @@
 #ifdef _WIN32
 #include "platform_windows.h"
 #include "windows_audio_backend.h"
-#include "windows_debug_log.h"
 #endif
 
 class QPaintEvent;
@@ -24,7 +23,7 @@ class WaveformWidget : public QWidget {
   explicit WaveformWidget(QWidget *parent = nullptr);
 
   void setPeaks(const QVector<int> &peaks);
-  void setEnvelopeMode(bool enabled);
+  void setPeakScale(double scale);
   void setPlayheadRatio(double ratio);
   void setLoopRegion(double start_ratio, double end_ratio, bool enabled);
 
@@ -33,7 +32,7 @@ class WaveformWidget : public QWidget {
 
  private:
   QVector<int> peaks_;
-  bool envelope_mode_ = false;
+  double peak_scale_ = 100.0;
   double playhead_ratio_ = 0.0;
   double loop_start_ratio_ = 0.0;
   double loop_end_ratio_ = 1.0;

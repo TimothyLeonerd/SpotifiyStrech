@@ -23,11 +23,12 @@ static void platform_windows_notify_command(PlatformWindowsHost *host, int comma
 }
 
 static void platform_windows_update_backend_ui(PlatformWindowsHost *host) {
-  unsigned char *pcm = NULL;
-  size_t pcm_len = 0;
   void *format_ptr = NULL;
   int capture_active = 0;
   int playback_active = 0;
+  uint16_t *wave_peaks = NULL;
+  size_t wave_peak_count = 0;
+  uint64_t captured_frames = 0;
   wchar_t status[128];
   wchar_t time_text[64];
   wchar_t play_pause_text[16];
@@ -38,14 +39,19 @@ static void platform_windows_update_backend_ui(PlatformWindowsHost *host) {
   }
 
   if (windows_audio_backend_snapshot(host->context,
-                                     &pcm,
-                                     &pcm_len,
-                                     &format_ptr,
-                                     &capture_active,
-                                     &playback_active)) {
+                                      NULL,
+                                      NULL,
+                                      &format_ptr,
+                                      &capture_active,
+                                      &playback_active,
+                                      NULL,
+                                      NULL,
+                                      &wave_peaks,
+                                      &wave_peak_count,
+                                      &captured_frames)) {
     format = (WAVEFORMATEX *)format_ptr;
-    const double seconds = (format && format->nAvgBytesPerSec > 0)
-      ? (double)pcm_len / (double)format->nAvgBytesPerSec
+    const double seconds = (format && format->nSamplesPerSec > 0)
+      ? (double)captured_frames / (double)format->nSamplesPerSec
       : 0.0;
 
     swprintf(status, sizeof status / sizeof status[0],
@@ -68,8 +74,8 @@ static void platform_windows_update_backend_ui(PlatformWindowsHost *host) {
     }
   }
 
-  free(pcm);
   free(format_ptr);
+  free(wave_peaks);
 }
 
 static void platform_windows_paint_waveform(HWND hwnd) {
@@ -77,107 +83,46 @@ static void platform_windows_paint_waveform(HWND hwnd) {
   HDC hdc = BeginPaint(hwnd, &ps);
   RECT rc;
   PlatformWindowsHost *host = (PlatformWindowsHost *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
-  unsigned char *pcm = NULL;
-  size_t pcm_len = 0;
   void *format_ptr = NULL;
   int capture_active = 0;
   int playback_active = 0;
+  uint16_t *wave_peaks = NULL;
+  size_t wave_peak_count = 0;
 
   GetClientRect(hwnd, &rc);
 
   FillRect(hdc, &rc, (HBRUSH)(COLOR_WINDOW + 1));
   if (host && host->context && windows_audio_backend_snapshot(host->context,
-                                                              &pcm,
-                                                              &pcm_len,
-                                                              &format_ptr,
-                                                              &capture_active,
-                                                              &playback_active)) {
-    WAVEFORMATEX *format = (WAVEFORMATEX *)format_ptr;
+                                                                NULL,
+                                                                NULL,
+                                                                &format_ptr,
+                                                                &capture_active,
+                                                                &playback_active,
+                                                                NULL,
+                                                                NULL,
+                                                                &wave_peaks,
+                                                                &wave_peak_count,
+                                                                NULL)) {
     const int width = rc.right - rc.left;
     const int height = rc.bottom - rc.top;
     const int mid_y = height / 2;
-    const int channels = (format && format->nChannels > 0) ? format->nChannels : 2;
-    const int bytes_per_sample = (format && format->nChannels > 0 && format->nBlockAlign > 0)
-                                   ? (int)(format->nBlockAlign / format->nChannels)
-                                   : 2;
-    const int is_float = windows_audio_backend_format_is_float(format_ptr);
 
     SetBkMode(hdc, TRANSPARENT);
     SetTextColor(hdc, RGB(230, 230, 235));
 
-    if (pcm && pcm_len > 0 && width > 0 && height > 0) {
+    if (wave_peaks && wave_peak_count > 0 && width > 0 && height > 0) {
       HPEN wave_pen = CreatePen(PS_SOLID, 1, RGB(120, 220, 160));
       HPEN old_pen = (HPEN)SelectObject(hdc, wave_pen);
-      {
-        const size_t frame_count = pcm_len / (size_t)(channels * bytes_per_sample);
-        const size_t target_points = (size_t)((width > 0) ? width : 1);
-        const size_t points = frame_count < target_points ? frame_count : target_points;
+      for (int x = 0; x < width; ++x) {
+        size_t peak_idx = (size_t)x * wave_peak_count / (size_t)width;
+        if (peak_idx >= wave_peak_count) {
+          peak_idx = wave_peak_count - 1;
+        }
 
-        for (size_t point_index = 0; point_index < points; ++point_index) {
-          const size_t start_frame = (point_index * frame_count) / points;
-          const size_t end_frame = ((point_index + 1) * frame_count) / points;
-          double min_amp = 1.0;
-          double max_amp = -1.0;
-          int have_sample = 0;
-
-          for (size_t frame_index = start_frame; frame_index < end_frame && frame_index < frame_count; ++frame_index) {
-            size_t i = frame_index * (size_t)channels * (size_t)bytes_per_sample;
-            if (is_float && bytes_per_sample == 4) {
-              const float *frame = (const float *)(pcm + i);
-              for (int c = 0; c < channels; ++c) {
-                double sample = frame[c];
-                if (sample < min_amp) min_amp = sample;
-                if (sample > max_amp) max_amp = sample;
-                have_sample = 1;
-              }
-            } else if (bytes_per_sample == 4) {
-              const int32_t *frame = (const int32_t *)(pcm + i);
-              for (int c = 0; c < channels; ++c) {
-                double sample = (double)frame[c] / 2147483648.0;
-                if (sample < min_amp) min_amp = sample;
-                if (sample > max_amp) max_amp = sample;
-                have_sample = 1;
-              }
-            } else if (bytes_per_sample == 3) {
-              const unsigned char *frame = pcm + i;
-              for (int c = 0; c < channels; ++c) {
-                const size_t offset = (size_t)c * 3;
-                int32_t sample = ((int32_t)frame[offset + 2] << 16) |
-                                 ((int32_t)frame[offset + 1] << 8) |
-                                 (int32_t)frame[offset];
-                if (sample & 0x00800000) sample |= ~0x00FFFFFF;
-                double value = (double)sample / 8388608.0;
-                if (value < min_amp) min_amp = value;
-                if (value > max_amp) max_amp = value;
-                have_sample = 1;
-              }
-            } else if (bytes_per_sample == 2) {
-              const int16_t *frame = (const int16_t *)(pcm + i);
-              for (int c = 0; c < channels; ++c) {
-                double sample = (double)frame[c] / 32768.0;
-                if (sample < min_amp) min_amp = sample;
-                if (sample > max_amp) max_amp = sample;
-                have_sample = 1;
-              }
-            } else {
-              const unsigned char *frame = pcm + i;
-              for (int c = 0; c < channels; ++c) {
-                double sample = ((double)frame[c] - 128.0) / 128.0;
-                if (sample < min_amp) min_amp = sample;
-                if (sample > max_amp) max_amp = sample;
-                have_sample = 1;
-              }
-            }
-          }
-
-          if (!have_sample) {
-            min_amp = 0.0;
-            max_amp = 0.0;
-          }
-          const int x = (points > 1) ? (int)((point_index * (size_t)(width - 1)) / (points - 1)) : 0;
-          const int y1 = mid_y - (int)(max_amp * (height * 0.42));
-          const int y2 = mid_y - (int)(min_amp * (height * 0.42));
-
+        {
+          const double amp = (double)wave_peaks[peak_idx] / 32768.0;
+          const int y1 = mid_y - (int)(amp * (height * 0.42));
+          const int y2 = mid_y + (int)(amp * (height * 0.42));
           MoveToEx(hdc, x, y1, NULL);
           LineTo(hdc, x, y2);
         }
@@ -191,8 +136,8 @@ static void platform_windows_paint_waveform(HWND hwnd) {
     }
   }
 
-  free(pcm);
   free(format_ptr);
+  free(wave_peaks);
   EndPaint(hwnd, &ps);
 }
 
