@@ -1,39 +1,41 @@
 # Spotify Audio Recorder
 
-This repo contains a GTK desktop app skeleton for a fuller audio recorder, plus the original PulseAudio prototype and planning docs.
+This repo now contains:
 
-For the next implementation pass, start with:
+- the Linux GTK/PulseAudio app
+- the Qt Widgets/Windows port in progress
+- shared transport/core helpers in `core.c`
+
+For implementation details, start with:
 
 - `BUILD_SPEC.md`
 - `IMPLEMENTATION_CHECKLIST.md`
+- `WINDOWS_PORT.md`
 
-## Build
+## Linux Build
 
 ```bash
 make
 ```
 
-This builds the GTK app skeleton as `spotify-recorder`.
+This builds the GTK app as `spotify-recorder`.
 
-## Run
+## Windows Qt Build
 
-```bash
-./spotify-recorder
+```bat
+.\build-run-qt.bat
 ```
 
-The current app is a UI scaffold with Record, Pause, Stop, Play, and speed controls.
+This configures and builds the Qt app with CMake, then deploys and runs it.
 
-## How it works
+## Current Shape
 
-1. Connects to PulseAudio.
-2. Reads the default sink name.
-3. Appends `.monitor` to capture the output of that sink.
-4. Records 16-bit stereo PCM at 44.1 kHz.
-5. Streams samples until stopped.
+- Linux remains the proven GTK/PulseAudio path.
+- Windows uses Qt Widgets plus a Windows audio backend.
+- Common state and transport logic is being moved into shared code.
 
 ## Notes
 
-- This records everything playing on your output device, not just Spotify.
-- Stop with `Ctrl-C`.
-- The longer-term goal is an app with an in-memory buffer, waveform display, and speed control.
-- Loop/transport implementation lessons are documented in `BUILD_SPEC.md` and regression checks are in `IMPLEMENTATION_CHECKLIST.md`.
+- Linux records system audio via the default sink monitor.
+- Windows uses the same peak-buffer waveform model as Linux.
+- The goal is to keep platform-specific code thin and share behavior wherever it is truly common.

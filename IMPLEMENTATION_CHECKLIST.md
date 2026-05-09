@@ -7,6 +7,12 @@
 - Add a speed slider with a default value of `1.0x`.
 - Add a placeholder area for waveform or timeline rendering.
 
+## Current State
+
+- Linux GTK/PulseAudio app remains the working baseline.
+- Windows Qt Widgets port is in progress.
+- Shared transport and loop logic should be reused from `core.c` wherever Linux and Windows need the same behavior.
+
 ## Phase 2: Capture and Buffering
 
 - Move PulseAudio capture into a background component.
@@ -57,3 +63,8 @@
 - Test custom loop: create a region, play through the end, confirm it wraps to the region start.
 - Test loop off: disable loop during playback and confirm playback continues forward without cursor jumps.
 - Test marker drag during playback and confirm the playhead/audio do not jump merely because the marker moved.
+
+## Porting Reminder
+
+- Do not add Windows-specific helpers to shared code unless Linux uses the exact same logic.
+- If behavior exists on both platforms, prefer one shared implementation over two similar copies.

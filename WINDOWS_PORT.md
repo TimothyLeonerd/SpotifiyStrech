@@ -1,14 +1,15 @@
 # Windows Port Notes
 
 ## Goal
-Port the current app to a Qt Widgets UI while keeping the existing core behavior.
+Port the current app to a Qt Widgets UI on Windows while keeping the proven Linux behavior and shared core logic intact.
 
 ## Current Architecture
-- `core.c` / `core.h`: portable logic
-- `app.c`: current GTK3 + PulseAudio app path
-- `qt_main.cpp` / `qt_recorder_window.cpp`: Qt Widgets UI shell
+- `core.c` / `core.h`: shared transport, loop, seek, and status logic
+- `app.c`: Linux GTK3 + PulseAudio app path
+- `qt_main.cpp` / `qt_recorder_window.cpp`: Qt Widgets UI path
+- `windows_main.c` / `platform_windows_win32.c`: native Win32 host path
 - `Makefile`: Linux build for GTK3, PulseAudio, Rubber Band
-- `CMakeLists.txt`: Qt Widgets build path
+- `CMakeLists.txt`: Qt/Windows build path
 
 ## Portable Core
 Already extracted into `core.c` / `core.h`:
@@ -21,12 +22,14 @@ Already extracted into `core.c` / `core.h`:
 - recording session reset
 
 ## Platform-Specific Layer
-Still in `app.c`:
-- GTK widget creation and callbacks
-- Cairo waveform drawing
-- PulseAudio capture/playback
-- pointer grab / scrubbing events
-- applying derived UI state to widgets
+Still platform-specific:
+- GTK widget creation and callbacks on Linux
+- Qt widget creation and callbacks on Windows Qt
+- Win32 host plumbing for the native Windows window
+- Cairo waveform drawing on Linux
+- Qt painting on Windows Qt
+- PulseAudio capture/playback on Linux
+- Windows audio backend on Windows
 
 ## App Behavior To Preserve
 - record / stop / play-pause
@@ -35,6 +38,7 @@ Still in `app.c`:
 - pitch-preserving speed changes via Rubber Band
 - async render of playback buffer
 - recording-time seek should survive into playback
+- peak-buffer waveform visualization should be shared in spirit, not reimplemented as separate UI logic
 
 ## Likely Windows Replacements
 - GTK UI -> Qt Widgets
@@ -43,7 +47,7 @@ Still in `app.c`:
 - drawing -> Qt painting
 
 ## Recommended Next Step
-Keep `core.c` unchanged and move the recorder UI/host into Qt Widgets.
+Keep `core.c` as the source of truth for shared state transitions, and move any duplicated Windows/Qt transport behavior to it instead of re-encoding it in UI code.
 
 Suggested adapter split:
 - audio backend: capture/playback/device selection
@@ -57,3 +61,4 @@ Build path:
 ## Notes
 - Current Linux build is clean.
 - The repo is already moving toward a portable core + adapter model.
+- Avoid adding Windows-only "shared" code unless Linux also uses the same behavior.

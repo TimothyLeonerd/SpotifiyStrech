@@ -1,4 +1,5 @@
 #include "qt_recorder_window.h"
+#include "core.h"
 
 #include <QBoxLayout>
 #include <QColor>
@@ -16,6 +17,20 @@
 #include <cmath>
 #include <string>
 #include <vector>
+
+namespace {
+AppMode toAppMode(RecorderMode mode) {
+  switch (mode) {
+    case RecorderMode::Recording: return MODE_RECORDING;
+    case RecorderMode::Preparing: return MODE_PREPARING;
+    case RecorderMode::Playing: return MODE_PLAYING;
+    case RecorderMode::Paused: return MODE_PAUSED;
+    case RecorderMode::Rendering: return MODE_RENDERING;
+    case RecorderMode::Idle:
+    default: return MODE_IDLE;
+  }
+}
+}
 
 WaveformWidget::WaveformWidget(QWidget *parent) : QWidget(parent) {
   setMinimumHeight(280);
@@ -155,7 +170,7 @@ RecorderWindow::RecorderWindow(QWidget *parent) : QMainWindow(parent) {
   setDefaultLoopRegion();
 
   time_label_ = new QLabel(QStringLiteral("0.0 / 0.0s"), central_);
-  status_label_ = new QLabel(QStringLiteral("Stopped | 0.0s captured"), central_);
+  status_label_ = new QLabel(QStringLiteral("Idle | 0.0s captured"), central_);
 
   root->addWidget(title_);
   root->addLayout(controls_row);
@@ -183,13 +198,19 @@ RecorderWindow::RecorderWindow(QWidget *parent) : QMainWindow(parent) {
 
   connect(record_button_, &QPushButton::clicked, this, [this]() {
 #ifdef _WIN32
+    const bool capture_running = windows_audio_backend_has_capture(windows_audio_context_.adapters.backend.audio_user_data) != 0;
+    const CoreTransportDecision decision = core_transport_decision(toAppMode(controller_.mode()), FALSE, capture_running, TRANSPORT_ACTION_RECORD);
     bool started = false;
-    if (windows_audio_context_.adapters.audio && windows_audio_context_.adapters.audio->start_capture) {
-      started = windows_audio_context_.adapters.audio->start_capture(windows_audio_context_.adapters.backend.audio_user_data, TRUE) != 0;
+
+    if (decision.plan.should_stop_playback && windows_audio_context_.adapters.audio && windows_audio_context_.adapters.audio->stop_playback) {
+      windows_audio_context_.adapters.audio->stop_playback(windows_audio_context_.adapters.backend.audio_user_data, !decision.plan.preserve_cursor);
+    }
+    if (decision.plan.should_start && windows_audio_context_.adapters.audio && windows_audio_context_.adapters.audio->start_capture) {
+      started = windows_audio_context_.adapters.audio->start_capture(windows_audio_context_.adapters.backend.audio_user_data, decision.plan.reset_buffers) != 0;
     }
     if (started) {
       controller_.record();
-    } else {
+    } else if (decision.plan.should_start) {
       controller_.stop();
     }
 #else
@@ -200,33 +221,55 @@ RecorderWindow::RecorderWindow(QWidget *parent) : QMainWindow(parent) {
 
   connect(stop_button_, &QPushButton::clicked, this, [this]() {
 #ifdef _WIN32
-    if (windows_audio_context_.adapters.audio) {
-      if (windows_audio_context_.adapters.audio->stop_playback) {
-        windows_audio_context_.adapters.audio->stop_playback(windows_audio_context_.adapters.backend.audio_user_data, TRUE);
-      }
-      if (windows_audio_context_.adapters.audio->stop_capture) {
-        windows_audio_context_.adapters.audio->stop_capture(windows_audio_context_.adapters.backend.audio_user_data, TRUE);
-      }
+    const CoreTransportDecision decision = core_transport_decision(toAppMode(controller_.mode()), FALSE, windows_audio_backend_has_capture(windows_audio_context_.adapters.backend.audio_user_data) != 0, TRANSPORT_ACTION_STOP);
+    if (decision.plan.should_stop_playback && windows_audio_context_.adapters.audio && windows_audio_context_.adapters.audio->stop_playback) {
+      windows_audio_context_.adapters.audio->stop_playback(windows_audio_context_.adapters.backend.audio_user_data, !decision.plan.preserve_cursor);
+    }
+    if (decision.plan.should_stop_capture && windows_audio_context_.adapters.audio && windows_audio_context_.adapters.audio->stop_capture) {
+      windows_audio_context_.adapters.audio->stop_capture(windows_audio_context_.adapters.backend.audio_user_data, TRUE);
     }
 #endif
-    controller_.stop();
+    if (decision.plan.preserve_cursor) {
+      controller_.setMode(RecorderMode::Idle);
+    } else {
+      controller_.stop();
+    }
     syncFromController();
   });
 
   connect(play_pause_button_, &QPushButton::clicked, this, [this]() {
 #ifdef _WIN32
+    const bool capture_running = windows_audio_backend_has_capture(windows_audio_context_.adapters.backend.audio_user_data) != 0;
+    const bool playback_active = windows_audio_backend_has_playback(windows_audio_context_.adapters.backend.audio_user_data) != 0;
+    const CoreTransportDecision decision = core_transport_decision(toAppMode(controller_.mode()), FALSE, capture_running, TRANSPORT_ACTION_PLAY_PAUSE);
     bool started = false;
-    if (windows_audio_context_.adapters.audio) {
-      const bool playback_active = windows_audio_backend_has_playback(windows_audio_context_.adapters.backend.audio_user_data) != 0;
-      if (playback_active) {
-        if (windows_audio_context_.adapters.audio->stop_playback) {
+
+    switch (decision.play_pause_action) {
+      case CORE_PLAY_PAUSE_START_FROM_IDLE:
+        if (capture_running && windows_audio_context_.adapters.audio && windows_audio_context_.adapters.audio->stop_capture) {
+          windows_audio_context_.adapters.audio->stop_capture(windows_audio_context_.adapters.backend.audio_user_data, FALSE);
+        }
+        if (windows_audio_context_.adapters.audio && windows_audio_context_.adapters.audio->start_playback) {
+          started = windows_audio_context_.adapters.audio->start_playback(windows_audio_context_.adapters.backend.audio_user_data) != 0;
+        }
+        controller_.setMode(started ? RecorderMode::Playing : RecorderMode::Idle);
+        break;
+      case CORE_PLAY_PAUSE_PAUSE:
+        if (playback_active && windows_audio_context_.adapters.audio && windows_audio_context_.adapters.audio->stop_playback) {
           windows_audio_context_.adapters.audio->stop_playback(windows_audio_context_.adapters.backend.audio_user_data, FALSE);
         }
-        controller_.stop();
-      } else if (windows_audio_context_.adapters.audio->start_playback) {
-        started = windows_audio_context_.adapters.audio->start_playback(windows_audio_context_.adapters.backend.audio_user_data) != 0;
-        controller_.setMode(started ? RecorderMode::Playing : RecorderMode::Idle);
-      }
+        controller_.setMode(RecorderMode::Paused);
+        break;
+      case CORE_PLAY_PAUSE_RESUME:
+        if (windows_audio_context_.adapters.audio && windows_audio_context_.adapters.audio->start_playback) {
+          started = windows_audio_context_.adapters.audio->start_playback(windows_audio_context_.adapters.backend.audio_user_data) != 0;
+        }
+        controller_.setMode(started ? RecorderMode::Playing : RecorderMode::Paused);
+        break;
+      case CORE_PLAY_PAUSE_TOGGLE_RENDER_INTENT:
+      case CORE_PLAY_PAUSE_IGNORED:
+      default:
+        break;
     }
 #else
     controller_.playPause();
@@ -346,7 +389,6 @@ void RecorderWindow::updatePlayPauseLabel() {
 }
 
 void RecorderWindow::setDefaultLoopRegion() {
-  controller_.setLoopRegion(0.2, 0.58, controller_.loopEnabled());
 }
 
 void RecorderWindow::syncFromController() {

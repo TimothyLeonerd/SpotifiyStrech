@@ -1,7 +1,30 @@
 #ifndef CORE_H
 #define CORE_H
 
+#if defined(__has_include)
+#if __has_include(<glib.h>)
 #include <glib.h>
+#define CORE_HAS_GLIB 1
+#endif
+#endif
+
+#ifndef CORE_HAS_GLIB
+#include <stddef.h>
+#include <stdint.h>
+typedef int gboolean;
+typedef double gdouble;
+typedef size_t gsize;
+typedef unsigned int guint;
+typedef int64_t gint64;
+typedef uint64_t guint64;
+typedef uint16_t guint16;
+typedef struct _GByteArray GByteArray;
+typedef struct _GArray GArray;
+#ifndef TRUE
+#define TRUE 1
+#define FALSE 0
+#endif
+#endif
 
 typedef enum {
   MODE_IDLE = 0,
@@ -113,6 +136,10 @@ typedef struct {
   char text[512];
 } CoreStatusState;
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 const char *core_mode_to_text(AppMode mode);
 gboolean core_mode_allows_record(AppMode mode);
 gboolean core_mode_allows_play_pause(AppMode mode);
@@ -187,13 +214,17 @@ gdouble core_compute_current_playback_frames(AppMode mode,
                                               gdouble speed,
                                               gint64 now_us);
 gdouble core_update_display_playhead(AppMode mode,
-                                     gboolean scrubbing,
-                                     gdouble display_playhead_frames,
-                                     gdouble playback_cursor_frames,
-                                     gdouble playback_anchor_frames,
-                                     gint64 playback_anchor_us,
-                                     guint rate,
-                                     gdouble speed,
-                                     gint64 now_us);
+                                      gboolean scrubbing,
+                                      gdouble display_playhead_frames,
+                                      gdouble playback_cursor_frames,
+                                      gdouble playback_anchor_frames,
+                                      gint64 playback_anchor_us,
+                                      guint rate,
+                                      gdouble speed,
+                                      gint64 now_us);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

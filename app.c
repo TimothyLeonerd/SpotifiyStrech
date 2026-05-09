@@ -2218,7 +2218,7 @@ static void activate(GtkApplication *app, gpointer user_data) {
   GtkWidget *speed_scale = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, 0.5, 2.0, 0.1);
   GtkWidget *waveform_base = gtk_drawing_area_new();
   GtkWidget *time_label = gtk_label_new("0.0 / 0.0s");
-  GtkWidget *status = gtk_label_new("Stopped | 0.0s captured");
+  GtkWidget *status = gtk_label_new("Idle | 0.0s captured");
   GtkWidget *progress_bar = gtk_progress_bar_new();
   gtk_progress_bar_pulse(GTK_PROGRESS_BAR(progress_bar));
   gtk_widget_set_no_show_all(progress_bar, TRUE);

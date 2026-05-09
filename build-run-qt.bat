@@ -16,10 +16,8 @@ if not exist "%QT_DIR%\bin\windeployqt.exe" (
   exit /b 1
 )
 
-if not exist "%BUILD_DIR%\CMakeCache.txt" (
-  cmake -S "%ROOT%" -B "%BUILD_DIR%" -G "Visual Studio 17 2022" -A x64 -DCMAKE_PREFIX_PATH="%QT_DIR%"
-  if errorlevel 1 exit /b %errorlevel%
-)
+cmake -S "%ROOT%" -B "%BUILD_DIR%" -G "Visual Studio 17 2022" -A x64 -DCMAKE_PREFIX_PATH="%QT_DIR%"
+if errorlevel 1 exit /b %errorlevel%
 
 cmake --build "%BUILD_DIR%" --config Release --verbose
 if errorlevel 1 exit /b %errorlevel%

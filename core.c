@@ -1,6 +1,68 @@
 #include "core.h"
 
 #include <math.h>
+#include <stdarg.h>
+#include <stdio.h>
+
+#ifndef CORE_HAS_GLIB
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
+static int core_snprintf(char *buffer, size_t size, const char *format, ...) {
+  int written;
+  va_list args;
+
+  va_start(args, format);
+#ifdef _MSC_VER
+  written = _vsnprintf_s(buffer, size, _TRUNCATE, format, args);
+#else
+  written = vsnprintf(buffer, size, format, args);
+#endif
+  va_end(args);
+  return written;
+}
+
+static void core_byte_array_set_size(GByteArray *array, size_t size) {
+  (void)array;
+  (void)size;
+}
+
+static void core_array_set_size(GArray *array, size_t size) {
+  (void)array;
+  (void)size;
+}
+
+static gint64 core_get_monotonic_time_us(void) {
+#ifdef _WIN32
+  return (gint64)GetTickCount64() * 1000;
+#else
+  return 0;
+#endif
+}
+#else
+static int core_snprintf(char *buffer, size_t size, const char *format, ...) {
+  int written;
+  va_list args;
+
+  va_start(args, format);
+  written = g_vsnprintf(buffer, size, format, args);
+  va_end(args);
+  return written;
+}
+
+static void core_byte_array_set_size(GByteArray *array, size_t size) {
+  g_byte_array_set_size(array, size);
+}
+
+static void core_array_set_size(GArray *array, size_t size) {
+  g_array_set_size(array, size);
+}
+
+static gint64 core_get_monotonic_time_us(void) {
+  return g_get_monotonic_time();
+}
+#endif
 
 const char *core_mode_to_text(AppMode mode) {
   switch (mode) {
@@ -59,22 +121,22 @@ CoreStatusState core_build_status_state(AppMode mode,
   CoreStatusState state = {{0}};
 
   if (error && error[0] != '\0') {
-    g_snprintf(state.text,
-               sizeof state.text,
-               "%s | %.1fs captured | %s | Loop %s%s",
-               core_mode_to_text(mode),
-               seconds,
-               error,
-               loop_enabled ? "on" : "off",
-               loop_region_set ? " (set)" : "");
+    core_snprintf(state.text,
+                  sizeof state.text,
+                  "%s | %.1fs captured | %s | Loop %s%s",
+                  core_mode_to_text(mode),
+                  seconds,
+                  error,
+                  loop_enabled ? "on" : "off",
+                  loop_region_set ? " (set)" : "");
   } else {
-    g_snprintf(state.text,
-               sizeof state.text,
-               "%s | %.1fs captured | Loop %s%s",
-               core_mode_to_text(mode),
-               seconds,
-               loop_enabled ? "on" : "off",
-               loop_region_set ? " (set)" : "");
+    core_snprintf(state.text,
+                  sizeof state.text,
+                  "%s | %.1fs captured | Loop %s%s",
+                  core_mode_to_text(mode),
+                  seconds,
+                  loop_enabled ? "on" : "off",
+                  loop_region_set ? " (set)" : "");
   }
 
   return state;
@@ -335,8 +397,8 @@ void core_reset_recording_session(AudioBuffer *audio,
                                   gint64 *playback_anchor_us,
                                   gdouble *display_playhead_frames) {
   if (audio) {
-    g_byte_array_set_size(audio->pcm, 0);
-    g_array_set_size(audio->wave_peaks, 0);
+    core_byte_array_set_size(audio->pcm, 0);
+    core_array_set_size(audio->wave_peaks, 0);
     audio->captured_frames = 0;
     audio->playback_valid = FALSE;
   }
@@ -362,7 +424,7 @@ void core_reset_recording_session(AudioBuffer *audio,
     *playback_anchor_frames = 0.0;
   }
   if (playback_anchor_us) {
-    *playback_anchor_us = g_get_monotonic_time();
+    *playback_anchor_us = core_get_monotonic_time_us();
   }
   if (display_playhead_frames) {
     *display_playhead_frames = 0.0;
@@ -414,7 +476,7 @@ void core_set_playback_cursor_state(gdouble frames,
     *playback_anchor_frames = frames;
   }
   if (playback_anchor_us) {
-    *playback_anchor_us = g_get_monotonic_time();
+    *playback_anchor_us = core_get_monotonic_time_us();
   }
   if (display_playhead_frames) {
     *display_playhead_frames = frames;

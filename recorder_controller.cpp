@@ -1,16 +1,28 @@
 #include "recorder_controller.h"
 
+#include "core.h"
+
 #include <chrono>
 #include <algorithm>
 #include <cmath>
-#include <iomanip>
-#include <sstream>
 #include <vector>
 
 namespace {
 std::int64_t nowUs() {
   using namespace std::chrono;
   return duration_cast<microseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
+AppMode toAppMode(RecorderMode mode) {
+  switch (mode) {
+    case RecorderMode::Recording: return MODE_RECORDING;
+    case RecorderMode::Preparing: return MODE_PREPARING;
+    case RecorderMode::Playing: return MODE_PLAYING;
+    case RecorderMode::Paused: return MODE_PAUSED;
+    case RecorderMode::Rendering: return MODE_RENDERING;
+    case RecorderMode::Idle:
+    default: return MODE_IDLE;
+  }
 }
 }  // namespace
 
@@ -39,26 +51,26 @@ void RecorderController::stop() {
 }
 
 void RecorderController::playPause() {
-  switch (mode_) {
-    case RecorderMode::Idle:
+  switch (core_transport_play_pause_action(toAppMode(mode_))) {
+    case CORE_PLAY_PAUSE_START_FROM_IDLE:
       mode_ = RecorderMode::Playing;
       playback_anchor_frames_ = playback_cursor_frames_;
       playback_anchor_us_ = nowUs();
       break;
-    case RecorderMode::Playing:
+    case CORE_PLAY_PAUSE_PAUSE:
       mode_ = RecorderMode::Paused;
       playback_cursor_frames_ = display_playhead_frames_;
       playback_anchor_frames_ = playback_cursor_frames_;
       playback_anchor_us_ = nowUs();
       break;
-    case RecorderMode::Paused:
+    case CORE_PLAY_PAUSE_RESUME:
       mode_ = RecorderMode::Playing;
       playback_anchor_frames_ = playback_cursor_frames_;
       playback_anchor_us_ = nowUs();
       break;
-    case RecorderMode::Recording:
-    case RecorderMode::Preparing:
-    case RecorderMode::Rendering:
+    case CORE_PLAY_PAUSE_TOGGLE_RENDER_INTENT:
+    case CORE_PLAY_PAUSE_IGNORED:
+    default:
       break;
   }
 }
@@ -90,12 +102,14 @@ void RecorderController::seekFraction(double fraction) {
   if (fraction < 0.0) fraction = 0.0;
   if (fraction > 1.0) fraction = 1.0;
 
-  const double target_frames = captured_frames_ * fraction;
-  resetPlayhead(target_frames);
-  if (mode_ == RecorderMode::Playing) {
-    playback_anchor_frames_ = target_frames;
-    playback_anchor_us_ = nowUs();
-  }
+  core_apply_seek_fraction(toAppMode(mode_),
+                           captured_frames_,
+                           fraction,
+                           &playback_cursor_frames_,
+                           &playback_anchor_frames_,
+                           &playback_anchor_us_,
+                           &display_playhead_frames_,
+                           nullptr);
 }
 
 void RecorderController::tick(double elapsed_seconds) {
@@ -103,43 +117,42 @@ void RecorderController::tick(double elapsed_seconds) {
     captured_frames_ += elapsed_seconds * sample_rate_;
   }
 
-  if (mode_ != RecorderMode::Playing) {
-    display_playhead_frames_ = playback_cursor_frames_;
-    return;
-  }
-
-  const double estimated = playback_anchor_frames_ + elapsedSecondsSinceAnchor() * sample_rate_ * speed_;
-  display_playhead_frames_ = std::max(playback_cursor_frames_, estimated);
+  display_playhead_frames_ = core_update_display_playhead(toAppMode(mode_),
+                                                          FALSE,
+                                                          display_playhead_frames_,
+                                                          playback_cursor_frames_,
+                                                          playback_anchor_frames_,
+                                                          playback_anchor_us_,
+                                                          static_cast<guint>(sample_rate_),
+                                                          speed_,
+                                                          nowUs());
 }
 
 RecorderUiState RecorderController::uiState() const {
   RecorderUiState state;
-  state.record_enabled = allowsRecord(mode_);
-  state.play_pause_enabled = allowsPlayPause(mode_);
-  state.loop_enabled = allowsLoop(mode_);
-  state.stop_enabled = allowsStop(mode_);
-  state.play_pause_label = playPauseLabel(mode_);
+  const CoreUiState core_state = core_build_ui_state(toAppMode(mode_), FALSE);
+
+  state.record_enabled = core_state.record_enabled;
+  state.play_pause_enabled = core_state.play_pause_enabled;
+  state.loop_enabled = core_state.loop_enabled;
+  state.stop_enabled = core_state.stop_enabled;
+  state.play_pause_label = core_state.play_pause_label ? core_state.play_pause_label : "";
   return state;
 }
 
 RecorderStatusState RecorderController::statusState() const {
   RecorderStatusState state;
-  std::ostringstream out;
-
-  out << modeText(mode_) << " | " << std::fixed << std::setprecision(1) << capturedSeconds() << "s captured | Loop "
-      << (loop_enabled_ ? "on" : "off");
-  if (loop_region_set_) {
-    out << " (set)";
-  }
-  state.text = out.str();
+  const CoreStatusState core_state = core_build_status_state(toAppMode(mode_),
+                                                             capturedSeconds(),
+                                                             nullptr,
+                                                             loop_enabled_,
+                                                             loop_region_set_);
+  state.text = core_state.text;
   return state;
 }
 
 double RecorderController::playheadRatio() const {
-  if (captured_frames_ <= 0.0) {
-    return 0.0;
-  }
-  return std::max(0.0, std::min(1.0, display_playhead_frames_ / captured_frames_));
+  return core_get_playhead_ratio(display_playhead_frames_, captured_frames_);
 }
 
 double RecorderController::speed() const {
@@ -170,11 +183,23 @@ void RecorderController::setSampleRate(double sample_rate) {
 }
 
 double RecorderController::loopStartRatio() const {
-  return captured_frames_ > 0.0 ? std::max(0.0, std::min(1.0, loop_start_frames_ / captured_frames_)) : 0.0;
+  LoopState loop = {0};
+  loop.enabled = loop_enabled_;
+  loop.region_set = loop_region_set_;
+  loop.start_frames = loop_start_frames_;
+  loop.end_frames = loop_end_frames_;
+  const LoopSnapshot snapshot = core_get_loop_snapshot(&loop, captured_frames_);
+  return snapshot.total_frames > 0.0 ? snapshot.start_frames / snapshot.total_frames : 0.0;
 }
 
 double RecorderController::loopEndRatio() const {
-  return captured_frames_ > 0.0 ? std::max(0.0, std::min(1.0, loop_end_frames_ / captured_frames_)) : 1.0;
+  LoopState loop = {0};
+  loop.enabled = loop_enabled_;
+  loop.region_set = loop_region_set_;
+  loop.start_frames = loop_start_frames_;
+  loop.end_frames = loop_end_frames_;
+  const LoopSnapshot snapshot = core_get_loop_snapshot(&loop, captured_frames_);
+  return snapshot.total_frames > 0.0 ? snapshot.end_frames / snapshot.total_frames : 1.0;
 }
 
 bool RecorderController::loopRegionSet() const {
@@ -202,43 +227,27 @@ std::vector<int> RecorderController::waveformPeaks() const {
 }
 
 const char *RecorderController::modeText(RecorderMode mode) {
-  switch (mode) {
-    case RecorderMode::Recording: return "Recording";
-    case RecorderMode::Preparing: return "Preparing";
-    case RecorderMode::Playing: return "Playing";
-    case RecorderMode::Paused: return "Paused";
-    case RecorderMode::Rendering: return "Rendering";
-    case RecorderMode::Idle:
-    default: return "Stopped";
-  }
+  return core_mode_to_text(toAppMode(mode));
 }
 
 bool RecorderController::allowsRecord(RecorderMode mode) {
-  return mode == RecorderMode::Idle;
+  return core_mode_allows_record(toAppMode(mode));
 }
 
 bool RecorderController::allowsPlayPause(RecorderMode mode) {
-  return mode == RecorderMode::Idle || mode == RecorderMode::Playing || mode == RecorderMode::Paused || mode == RecorderMode::Rendering;
+  return core_mode_allows_play_pause(toAppMode(mode));
 }
 
 bool RecorderController::allowsStop(RecorderMode mode) {
-  return mode == RecorderMode::Recording || mode == RecorderMode::Preparing || mode == RecorderMode::Playing || mode == RecorderMode::Paused || mode == RecorderMode::Rendering;
+  return core_mode_allows_stop(toAppMode(mode));
 }
 
 bool RecorderController::allowsLoop(RecorderMode mode) {
-  return mode == RecorderMode::Idle || mode == RecorderMode::Recording || mode == RecorderMode::Playing || mode == RecorderMode::Paused || mode == RecorderMode::Rendering;
+  return core_mode_allows_loop(toAppMode(mode));
 }
 
 const char *RecorderController::playPauseLabel(RecorderMode mode) {
-  switch (mode) {
-    case RecorderMode::Playing: return "Pause";
-    case RecorderMode::Paused: return "Play";
-    case RecorderMode::Idle:
-    case RecorderMode::Recording:
-    case RecorderMode::Preparing:
-    case RecorderMode::Rendering:
-    default: return "Play";
-  }
+  return core_play_pause_label_for_mode(toAppMode(mode), FALSE);
 }
 
 void RecorderController::resetPlayhead(double frames) {

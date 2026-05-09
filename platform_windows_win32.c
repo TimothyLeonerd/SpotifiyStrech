@@ -1,3 +1,4 @@
+#include "core.h"
 #include "platform_windows_win32.h"
 #include "windows_audio_backend.h"
 #include "windows_debug_log.h"
@@ -45,20 +46,21 @@ static void platform_windows_update_backend_ui(PlatformWindowsHost *host) {
                                       &capture_active,
                                       &playback_active,
                                       NULL,
-                                      NULL,
-                                      &wave_peaks,
-                                      &wave_peak_count,
-                                      &captured_frames)) {
+                                       NULL,
+                                       &wave_peaks,
+                                       &wave_peak_count,
+                                       &captured_frames)) {
     format = (WAVEFORMATEX *)format_ptr;
     const double seconds = (format && format->nSamplesPerSec > 0)
       ? (double)captured_frames / (double)format->nSamplesPerSec
       : 0.0;
+    const AppMode mode = capture_active ? MODE_RECORDING : (playback_active ? MODE_PLAYING : MODE_IDLE);
+    const CoreStatusState status_state = core_build_status_state(mode, seconds, NULL, FALSE, FALSE);
+    const CoreUiState ui_state = core_build_ui_state(mode, FALSE);
 
-    swprintf(status, sizeof status / sizeof status[0],
-             capture_active ? L"Capturing | %.1fs captured" : (playback_active ? L"Playing | %.1fs captured" : L"Stopped | %.1fs captured"),
-             seconds);
+    swprintf(status, sizeof status / sizeof status[0], L"%hs", status_state.text);
     swprintf(time_text, sizeof time_text / sizeof time_text[0], L"%.1f / %.1fs", seconds, seconds);
-    swprintf(play_pause_text, sizeof play_pause_text / sizeof play_pause_text[0], playback_active ? L"Pause" : L"Play");
+    swprintf(play_pause_text, sizeof play_pause_text / sizeof play_pause_text[0], L"%hs", ui_state.play_pause_label);
 
     if (host->context->status_label) {
       SetWindowTextW(host->context->status_label, status);
@@ -168,7 +170,7 @@ static void platform_windows_init_children(PlatformWindowsHost *host) {
   HINSTANCE instance = host->instance;
   HWND parent = host->window;
 
-  host->context->status_label = platform_windows_create_child(parent, instance, L"STATIC", L"Stopped | 0.0s captured", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, 1001);
+  host->context->status_label = platform_windows_create_child(parent, instance, L"STATIC", L"Idle | 0.0s captured", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, 1001);
   host->context->speed_value_label = platform_windows_create_child(parent, instance, L"STATIC", L"1.0x", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, 1002);
   host->context->time_label = platform_windows_create_child(parent, instance, L"STATIC", L"0.0 / 0.0s", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, 1003);
   host->context->waveform_view = platform_windows_create_child(parent, instance, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_OWNERDRAW, 0, 0, 0, 0, 1004);

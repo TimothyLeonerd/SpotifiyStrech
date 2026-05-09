@@ -19,6 +19,7 @@ else()
 endif()
 
 add_executable(spotify-recorder-qt
+  core.c
   recorder_controller.cpp
   qt_main.cpp
   qt_recorder_window.cpp
@@ -46,6 +47,7 @@ endif()
 
 if (WIN32)
   add_executable(spotify-recorder-win32
+    core.c
     windows_main.c
     platform_windows_win32.c
     windows_audio_backend.c

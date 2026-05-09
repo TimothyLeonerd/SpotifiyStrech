@@ -191,3 +191,9 @@ Before implementing, decide:
 2. Add in-memory PCM buffering.
 3. Hook capture into the GTK window.
 4. Add waveform rendering once capture works in-app.
+
+## Current Status
+
+- Linux GTK/PulseAudio remains the proven baseline.
+- Windows is being ported with Qt Widgets and a Windows audio backend.
+- Shared logic is being extracted only where Linux and Windows truly need the same behavior.
