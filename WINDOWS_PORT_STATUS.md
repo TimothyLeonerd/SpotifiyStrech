@@ -59,10 +59,14 @@ The next architectural milestone is documented in `SHARED_RECORDER_REFACTOR_PLAN
 - [x] Windows backend snapshots no longer mutate Qt/`RecorderCore` app mode.
 - [x] Windows render progress polling no longer clears `RecorderCore.render_pending`; render completion is the sole render finalizer.
 - [x] Windows capture synthesizes silent PCM when WASAPI loopback reports no packets, so no-source recording still advances duration with a flat waveform.
+- [x] Windows playback cursor is derived from WASAPI queued padding during playback, so loop wraps report the audible position instead of the write-ahead cursor.
+- [x] Windows loop cursor math remains linear before the first actual queued loop wrap, so seeking before a loop does not display a circular-loop position early.
+- [x] Windows loop playback uses Linux-style temporary loop arming: seeking past loop end continues linearly instead of forcing an immediate wrap.
 
 ### Partial
 - [ ] Windows seek/scrub parity still needs runtime regression testing on real WASAPI output.
 - [ ] Windows loop playback needs runtime validation against Linux edge cases.
+- [ ] Windows loop cursor/audio sync needs runtime validation after the WASAPI padding-based cursor change.
 - [ ] Windows speed/render parity needs runtime validation, especially cursor mapping during non-1.0x playback.
 - [ ] Windows no-source recording needs runtime validation on real WASAPI output.
 - [ ] Windows transport/state ownership is partially shared; Qt still owns platform I/O sequencing and the Windows backend still owns transport state that should move into `RecorderCore`.

@@ -502,6 +502,8 @@ static BOOL windows_audio_install_prepared_buffer_locked(WindowsAudioBackendStat
   return TRUE;
 }
 
+static size_t windows_audio_output_bytes_to_source_bytes(size_t output_bytes, size_t block_align, gdouble rendered_to_source_ratio, size_t source_total_bytes);
+
 static size_t windows_audio_frame_align_bytes(size_t bytes, size_t block_align) {
   if (block_align == 0) {
     return bytes;
@@ -510,31 +512,59 @@ static size_t windows_audio_frame_align_bytes(size_t bytes, size_t block_align) 
 }
 
 static size_t windows_audio_audible_cursor_locked(const WindowsAudioBackendState *state) {
-  size_t cursor;
-  ULONGLONG elapsed_ms;
-  size_t elapsed_bytes;
-
   if (!state) {
     return 0;
   }
+  return windows_audio_frame_align_bytes(state->playback_cursor_bytes, state->playback_block_align);
+}
 
-  cursor = state->playback_cursor_bytes;
-  if (!state->playback_active || state->playback_avg_bytes_per_sec == 0 || state->playback_anchor_ms == 0) {
-    return cursor;
+static size_t windows_audio_rewind_output_cursor(size_t tail_bytes,
+                                                size_t queued_bytes,
+                                                size_t loop_start_bytes,
+                                                size_t loop_end_bytes,
+                                                BOOL loop_valid,
+                                                BOOL loop_wrapped) {
+  if (!loop_valid || !loop_wrapped) {
+    return queued_bytes >= tail_bytes ? 0 : tail_bytes - queued_bytes;
   }
 
-  elapsed_ms = GetTickCount64() - state->playback_anchor_ms;
-  elapsed_bytes = (size_t)(((unsigned long long)state->playback_avg_bytes_per_sec * elapsed_ms) / 1000ULL);
-  elapsed_bytes = windows_audio_frame_align_bytes(elapsed_bytes, state->playback_block_align);
-  cursor = state->playback_anchor_cursor_bytes + elapsed_bytes;
+  if (loop_end_bytes <= loop_start_bytes) {
+    return queued_bytes >= tail_bytes ? 0 : tail_bytes - queued_bytes;
+  }
 
-  if (cursor > state->playback_queued_cursor_bytes) {
-    cursor = state->playback_queued_cursor_bytes;
+  {
+    const size_t loop_len = loop_end_bytes - loop_start_bytes;
+    const size_t queued_mod = queued_bytes % loop_len;
+    size_t offset;
+
+    if (tail_bytes < loop_start_bytes || tail_bytes >= loop_end_bytes) {
+      tail_bytes = loop_start_bytes;
+    }
+
+    offset = tail_bytes - loop_start_bytes;
+    if (queued_mod <= offset) {
+      return tail_bytes - queued_mod;
+    }
+    return loop_end_bytes - (queued_mod - offset);
   }
-  if (state->playback_total_bytes > 0 && cursor > state->playback_total_bytes) {
-    cursor = state->playback_total_bytes;
+}
+
+static size_t windows_audio_output_cursor_to_source_bytes(size_t output_bytes,
+                                                         size_t source_block_align,
+                                                         gdouble rendered_to_source_ratio,
+                                                         size_t playback_base_offset,
+                                                         size_t source_total_bytes) {
+  size_t source_bytes = windows_audio_output_bytes_to_source_bytes(output_bytes,
+                                                                  source_block_align,
+                                                                  rendered_to_source_ratio,
+                                                                  source_total_bytes);
+  if (playback_base_offset > source_total_bytes) {
+    return source_total_bytes;
   }
-  return windows_audio_frame_align_bytes(cursor, state->playback_block_align);
+  if (source_bytes > source_total_bytes - playback_base_offset) {
+    return source_total_bytes;
+  }
+  return windows_audio_frame_align_bytes(playback_base_offset + source_bytes, source_block_align);
 }
 
 static size_t windows_audio_source_bytes_to_output_bytes(size_t source_bytes, size_t block_align, gdouble rendered_to_source_ratio) {
@@ -920,6 +950,8 @@ static DWORD WINAPI windows_playback_thread(LPVOID param) {
   size_t cursor = 0;
   gdouble rendered_to_source_ratio = 1.0;
   BOOL loop_valid = FALSE;
+  BOOL loop_armed = FALSE;
+  BOOL loop_wrapped = FALSE;
   HRESULT hr;
 
   if (!state) {
@@ -1005,12 +1037,18 @@ static DWORD WINAPI windows_playback_thread(LPVOID param) {
   EnterCriticalSection(&state->lock);
   state->playback_active = TRUE;
   state->playback_total_bytes = source_total_bytes;
-  cursor = windows_audio_source_bytes_to_output_bytes(state->playback_cursor_bytes, source_format->nBlockAlign, rendered_to_source_ratio);
+  cursor = state->playback_cursor_bytes > playback_base_offset
+    ? windows_audio_source_bytes_to_output_bytes(state->playback_cursor_bytes - playback_base_offset, source_format->nBlockAlign, rendered_to_source_ratio)
+    : 0;
   if (cursor > snapshot_len) {
     cursor = snapshot_len;
     state->playback_cursor_bytes = source_total_bytes;
   }
-  state->playback_queued_cursor_bytes = windows_audio_output_bytes_to_source_bytes(cursor, source_format->nBlockAlign, rendered_to_source_ratio, source_total_bytes);
+  state->playback_queued_cursor_bytes = windows_audio_output_cursor_to_source_bytes(cursor,
+                                                                                   source_format->nBlockAlign,
+                                                                                   rendered_to_source_ratio,
+                                                                                   playback_base_offset,
+                                                                                   source_total_bytes);
   state->playback_anchor_cursor_bytes = state->playback_cursor_bytes;
   state->playback_avg_bytes_per_sec = (size_t)((gdouble)source_format->nAvgBytesPerSec * rendered_to_source_ratio);
   state->playback_block_align = source_format->nBlockAlign;
@@ -1020,16 +1058,22 @@ static DWORD WINAPI windows_playback_thread(LPVOID param) {
   {
     UINT32 buffer_frames = 0;
     UINT32 bytes_per_frame = render_format->nBlockAlign;
+    UINT32 target_padding_frames = render_format->nSamplesPerSec / 10;
 
     if (FAILED(IAudioClient_GetBufferSize(client, &buffer_frames))) {
       goto cleanup;
     }
+    if (target_padding_frames < 512) {
+      target_padding_frames = 512;
+    }
+    if (target_padding_frames > buffer_frames) {
+      target_padding_frames = buffer_frames;
+    }
 
-  while (WaitForSingleObject(state->playback_stop_event, 10) == WAIT_TIMEOUT) {
+    while (WaitForSingleObject(state->playback_stop_event, 10) == WAIT_TIMEOUT) {
       UINT32 padding = 0;
       UINT32 available = 0;
       BYTE *render_data = NULL;
-      BOOL wrapped = FALSE;
 
       loop_valid = FALSE;
       loop_start_rel = 0;
@@ -1066,16 +1110,50 @@ static DWORD WINAPI windows_playback_thread(LPVOID param) {
           }
         }
       }
+      if (!loop_valid) {
+        loop_armed = FALSE;
+        loop_wrapped = FALSE;
+      } else if (!loop_armed && cursor < loop_end_rel) {
+        loop_armed = TRUE;
+      } else if (!loop_armed) {
+        loop_wrapped = FALSE;
+      }
 
       if (FAILED(IAudioClient_GetCurrentPadding(client, &padding))) {
         break;
       }
       available = buffer_frames - padding;
+      {
+        const size_t queued_bytes = (size_t)padding * bytes_per_frame;
+        const size_t audible_output = windows_audio_rewind_output_cursor(cursor, queued_bytes, loop_start_rel, loop_end_rel, loop_valid && loop_armed, loop_wrapped);
+        EnterCriticalSection(&state->lock);
+        state->playback_queued_cursor_bytes = windows_audio_output_cursor_to_source_bytes(cursor,
+                                                                                         source_format->nBlockAlign,
+                                                                                         rendered_to_source_ratio,
+                                                                                         playback_base_offset,
+                                                                                         source_total_bytes);
+        state->playback_cursor_bytes = windows_audio_output_cursor_to_source_bytes(audible_output,
+                                                                                  source_format->nBlockAlign,
+                                                                                  rendered_to_source_ratio,
+                                                                                  playback_base_offset,
+                                                                                  source_total_bytes);
+        state->playback_anchor_cursor_bytes = state->playback_cursor_bytes;
+        state->playback_anchor_ms = GetTickCount64();
+        state->playback_total_bytes = source_total_bytes;
+        LeaveCriticalSection(&state->lock);
+      }
+
+      if (target_padding_frames > 0 && padding >= target_padding_frames) {
+        continue;
+      }
+      if (target_padding_frames > 0 && available > target_padding_frames - padding) {
+        available = target_padding_frames - padding;
+      }
       if (available == 0) {
         continue;
       }
 
-      if (!loop_valid) {
+      if (!loop_valid || !loop_armed) {
         const size_t remaining_bytes = (cursor < snapshot_len) ? (snapshot_len - cursor) : 0;
         UINT32 remaining_frames = bytes_per_frame > 0 ? (UINT32)(remaining_bytes / bytes_per_frame) : 0;
         if (remaining_frames == 0) {
@@ -1100,7 +1178,7 @@ static DWORD WINAPI windows_playback_thread(LPVOID param) {
           size_t segment_remaining;
           size_t to_copy;
 
-          if (loop_valid) {
+          if (loop_valid && loop_armed) {
             if (cursor >= loop_end_rel) {
               cursor = loop_start_rel;
             }
@@ -1121,15 +1199,15 @@ static DWORD WINAPI windows_playback_thread(LPVOID param) {
           cursor += to_copy;
           written += to_copy;
 
-          if (loop_valid && cursor >= loop_end_rel) {
+          if (loop_valid && loop_armed && cursor >= loop_end_rel) {
             cursor = loop_start_rel;
-            wrapped = TRUE;
+            loop_wrapped = TRUE;
           }
         }
 
         if (written < bytes) {
           memset(render_data + written, 0, bytes - written);
-          if (!loop_valid && cursor >= snapshot_len) {
+          if ((!loop_valid || !loop_armed) && cursor >= snapshot_len) {
             cursor = snapshot_len;
           }
         }
@@ -1137,17 +1215,25 @@ static DWORD WINAPI windows_playback_thread(LPVOID param) {
 
       IAudioRenderClient_ReleaseBuffer(render_client, available, 0);
       EnterCriticalSection(&state->lock);
-        state->playback_queued_cursor_bytes = windows_audio_output_bytes_to_source_bytes(cursor, source_format->nBlockAlign, rendered_to_source_ratio, source_total_bytes);
-        if (wrapped) {
-          state->playback_cursor_bytes = state->playback_queued_cursor_bytes;
+        {
+          const size_t queued_bytes = (size_t)(padding + available) * bytes_per_frame;
+          const size_t audible_output = windows_audio_rewind_output_cursor(cursor, queued_bytes, loop_start_rel, loop_end_rel, loop_valid && loop_armed, loop_wrapped);
+          state->playback_queued_cursor_bytes = windows_audio_output_cursor_to_source_bytes(cursor,
+                                                                                           source_format->nBlockAlign,
+                                                                                           rendered_to_source_ratio,
+                                                                                           playback_base_offset,
+                                                                                           source_total_bytes);
+          state->playback_cursor_bytes = windows_audio_output_cursor_to_source_bytes(audible_output,
+                                                                                    source_format->nBlockAlign,
+                                                                                    rendered_to_source_ratio,
+                                                                                    playback_base_offset,
+                                                                                    source_total_bytes);
           state->playback_anchor_cursor_bytes = state->playback_cursor_bytes;
           state->playback_anchor_ms = GetTickCount64();
-        } else {
-          state->playback_cursor_bytes = windows_audio_audible_cursor_locked(state);
         }
         state->playback_total_bytes = source_total_bytes;
         LeaveCriticalSection(&state->lock);
-        if (!loop_valid && cursor >= snapshot_len) {
+        if ((!loop_valid || !loop_armed) && cursor >= snapshot_len) {
         {
           char end_message[160];
           wsprintfA(end_message, "playback exit cursor=%lu snapshot_bytes=%lu", (unsigned long)cursor, (unsigned long)snapshot_len);
@@ -1162,6 +1248,19 @@ cleanup:
   if (client) {
     IAudioClient_Stop(client);
   }
+  EnterCriticalSection(&state->lock);
+  state->playback_queued_cursor_bytes = windows_audio_output_cursor_to_source_bytes(cursor,
+                                                                                   source_format ? source_format->nBlockAlign : 0,
+                                                                                   rendered_to_source_ratio,
+                                                                                   playback_base_offset,
+                                                                                   source_total_bytes);
+  state->playback_cursor_bytes = windows_audio_audible_cursor_locked(state);
+  if ((!loop_valid || !loop_armed) && cursor >= snapshot_len) {
+    state->playback_cursor_bytes = source_total_bytes;
+  }
+  state->playback_total_bytes = source_total_bytes;
+  state->playback_active = FALSE;
+  LeaveCriticalSection(&state->lock);
   if (render_client) {
     IAudioRenderClient_Release(render_client);
   }
@@ -1175,15 +1274,6 @@ cleanup:
   if (render_format) {
     free(render_format);
   }
-  EnterCriticalSection(&state->lock);
-  state->playback_queued_cursor_bytes = windows_audio_output_bytes_to_source_bytes(cursor, source_format ? source_format->nBlockAlign : 0, rendered_to_source_ratio, source_total_bytes);
-  state->playback_cursor_bytes = windows_audio_audible_cursor_locked(state);
-  if (!loop_valid && cursor >= snapshot_len) {
-    state->playback_cursor_bytes = source_total_bytes;
-  }
-  state->playback_total_bytes = source_total_bytes;
-  state->playback_active = FALSE;
-  LeaveCriticalSection(&state->lock);
 
   CoUninitialize();
   return 0;
