@@ -23,17 +23,23 @@ $(RUBBERBAND_LIB): $(RUBBERBAND_BUILD)/build.ninja
 core.o: core.c core.h
 	$(CC) $(CFLAGS) $(GTK_CFLAGS) $(PULSE_CFLAGS) -c -o $@ $<
 
+recorder_core.o: recorder_core.c recorder_core.h core.h
+	$(CC) $(CFLAGS) $(GTK_CFLAGS) -c -o $@ $<
+
 platform_linux.o: platform_linux.c platform_linux.h platform.h
 	$(CC) $(CFLAGS) $(GTK_CFLAGS) -c -o $@ $<
 
 linux_audio_backend.o: linux_audio_backend.c linux_audio_backend.h platform.h
 	$(CC) $(CFLAGS) $(GTK_CFLAGS) $(PULSE_CFLAGS) -c -o $@ $<
 
-app.o: app.c core.h $(RUBBERBAND_LIB)
-	$(CC) $(CFLAGS) $(GTK_CFLAGS) $(PULSE_CFLAGS) $(RUBBERBAND_CFLAGS) -c -o $@ $<
+playback_renderer.o: playback_renderer.c playback_renderer.h $(RUBBERBAND_LIB)
+	$(CC) $(CFLAGS) $(RUBBERBAND_CFLAGS) -c -o $@ $<
 
-$(TARGET): core.o platform_linux.o linux_audio_backend.o app.o $(RUBBERBAND_LIB)
-	$(CXX) -o $@ core.o platform_linux.o linux_audio_backend.o app.o $(RUBBERBAND_LIB) $(GTK_LIBS) $(PULSE_LIBS) -lm -pthread
+app.o: app.c core.h recorder_core.h playback_renderer.h
+	$(CC) $(CFLAGS) $(GTK_CFLAGS) $(PULSE_CFLAGS) -c -o $@ $<
+
+$(TARGET): core.o recorder_core.o platform_linux.o linux_audio_backend.o playback_renderer.o app.o $(RUBBERBAND_LIB)
+	$(CXX) -o $@ core.o recorder_core.o platform_linux.o linux_audio_backend.o playback_renderer.o app.o $(RUBBERBAND_LIB) $(GTK_LIBS) $(PULSE_LIBS) -lm -pthread
 
 clean:
 	rm -f $(TARGET) *.o *.wav

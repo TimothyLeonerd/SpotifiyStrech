@@ -2,6 +2,7 @@
 #define PLATFORM_WINDOWS_H
 
 #include "platform.h"
+#include "recorder_core.h"
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -22,6 +23,7 @@ typedef struct PlatformWindowsContext {
   HINSTANCE instance;
   HWND window;
   ATOM window_class;
+  RecorderCore *recorder_core;
   void *audio_state;
   HWND status_label;
   HWND speed_value_label;

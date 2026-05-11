@@ -7,6 +7,7 @@
 #include "core.h"
 #include "platform.h"
 #include "platform_linux.h"
+#include "recorder_core.h"
 
 typedef struct {
   GtkWidget *status_label;
@@ -26,17 +27,28 @@ typedef struct Recorder {
   PlatformAdapters platform;
 
   GMutex mutex;
-  AudioBuffer audio;
-  gdouble speed;
-  gdouble playback_cursor_frames;
-  gdouble playback_anchor_frames;
-  gint64 playback_anchor_us;
-  gdouble display_playhead_frames;
-  LoopState loop;
-  gboolean scrubbing;
-  gboolean resume_after_scrub;
+  union {
+    RecorderCore core;
+    struct {
+      AudioBuffer audio;
+      gdouble speed;
+      gdouble playback_cursor_frames;
+      gdouble playback_anchor_frames;
+      gint64 playback_anchor_us;
+      gdouble display_playhead_frames;
+      LoopState loop;
+      gboolean scrubbing;
+      gboolean resume_after_scrub;
 
-  AppMode mode;
+      AppMode mode;
+      gboolean render_pending;
+      AppMode render_source_mode;
+      RenderIntent render_intent;
+      guint render_generation;
+      gint64 render_started_us;
+      gdouble render_estimated_total_us;
+    };
+  };
   gboolean stop_requested;
   gboolean capture_running;
   GThread *capture_thread;
@@ -47,14 +59,8 @@ typedef struct Recorder {
   guint tick_callback_id;
   gint last_playhead_x;
   char last_error[256];
-  gboolean render_pending;
-  AppMode render_source_mode;
-  RenderIntent render_intent;
   GThread *render_thread;
   guint render_pulse_source;
-  guint render_generation;
-  gint64 render_started_us;
-  gdouble render_estimated_total_us;
   gulong loop_toggled_handler_id;
 } Recorder;
 

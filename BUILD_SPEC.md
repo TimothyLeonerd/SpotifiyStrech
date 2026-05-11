@@ -61,17 +61,9 @@ This avoids corrupting the original recording.
 
 ## Playback Speed
 
-Two possible interpretations:
+Playback speed should preserve pitch.
 
-1. Speed changes pitch too.
-- Simpler.
-- Can be implemented by resampling.
-
-2. Speed changes without pitch shift.
-- Better UX for most users.
-- Requires a time-stretch library such as Rubber Band or SoundTouch.
-
-If unsure, implement pitch-changing speed first, then upgrade later.
+The project uses Rubber Band to render a derived playback buffer for the requested speed. Raw captured PCM remains the source of truth, and rendered playback PCM is disposable derived data that can be regenerated when speed or source audio changes.
 
 ## Visualization
 
@@ -134,7 +126,7 @@ Use locks or message passing carefully. Keep the UI responsive.
 - Avoid coupling loop edits to segment rendering. Re-rendering a stretched segment during marker drag can re-anchor output offsets and make audio/playhead jump.
 - Be careful with lock ownership. Do not call helper functions that lock `Recorder.mutex` while already holding that mutex.
 - Keep transport and loop concerns separate. Scrubbing/seeking changes playback cursor; loop editing changes loop boundaries.
-- If a full architecture refactor happens, split state into transport state, loop state, playback engine, waveform view, and GTK controller instead of letting all callbacks mutate one shared struct arbitrarily.
+- The current architecture refactor target is documented in `SHARED_RECORDER_REFACTOR_PLAN.md`: move authoritative transport, loop, render, seek, scrub, and playback-buffer state into a shared Recorder/controller used by both GTK and Qt.
 
 ## Recommended Stack
 
@@ -179,11 +171,10 @@ If the buffer and UI logic become large, C++ may be easier than plain C.
 
 ## Open Questions
 
-Before implementing, decide:
+Before expanding the product, decide:
 
-1. Do you want pitch to change with playback speed?
-2. Should recording be system-wide audio or Spotify-only?
-3. Should the buffer be infinite or have a fixed max length?
+1. Should recording be system-wide audio or Spotify-only?
+2. Should the buffer be infinite or have a fixed max length?
 
 ## Suggested Start Point
 
@@ -197,3 +188,15 @@ Before implementing, decide:
 - Linux GTK/PulseAudio remains the proven baseline.
 - Windows is being ported with Qt Widgets and a Windows audio backend.
 - Shared logic is being extracted only where Linux and Windows truly need the same behavior.
+- The live Windows state lives in `WINDOWS_PORT_STATUS.md`; update it whenever behavior changes.
+
+## Porting Rule
+
+The Windows implementation must match the Linux transport model:
+
+- shared behavior should match Linux across the full feature set unless Windows-specific behavior is explicitly documented
+- seek updates the same conceptual playback cursor as Linux
+- loop edits remain pure boundary edits
+- playback only changes cursor/state in the same cases Linux does
+- derived playback buffers are allowed; raw capture bytes are not the playback source of truth
+- if a Windows path does something Linux does not, assume the Windows path is wrong unless explicitly documented here

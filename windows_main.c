@@ -21,7 +21,7 @@ static void windows_host_command_dispatch(void *user_data, int command_id) {
         if (context->adapters.audio->stop_playback) {
           context->adapters.audio->stop_playback(context->adapters.backend.audio_user_data, FALSE);
         }
-      } else if (context->adapters.audio->start_playback) {
+      } else if (windows_audio_backend_prepare_playback_buffer(context->adapters.backend.audio_user_data, 1.0) && context->adapters.audio->start_playback) {
         context->adapters.audio->start_playback(context->adapters.backend.audio_user_data);
       }
       break;

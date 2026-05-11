@@ -20,10 +20,15 @@ endif()
 
 add_executable(spotify-recorder-qt
   core.c
-  recorder_controller.cpp
+  recorder_core.c
+  playback_renderer.c
   qt_main.cpp
   qt_recorder_window.cpp
+  third_party/rubberband/single/RubberBandSingle.cpp
 )
+
+target_include_directories(spotify-recorder-qt PRIVATE third_party/rubberband)
+target_compile_definitions(spotify-recorder-qt PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 
 if (WIN32)
   target_sources(spotify-recorder-qt PRIVATE
@@ -43,21 +48,4 @@ target_link_libraries(spotify-recorder-qt PRIVATE ${QT_PACKAGE}::Widgets)
 
 if (WIN32)
   set_target_properties(spotify-recorder-qt PROPERTIES WIN32_EXECUTABLE ON)
-endif()
-
-if (WIN32)
-  add_executable(spotify-recorder-win32
-    core.c
-    windows_main.c
-    platform_windows_win32.c
-    windows_audio_backend.c
-  )
-  target_link_libraries(spotify-recorder-win32 PRIVATE
-    comctl32
-    ole32
-    uuid
-    avrt
-    mmdevapi
-  )
-  set_target_properties(spotify-recorder-win32 PROPERTIES WIN32_EXECUTABLE ON)
 endif()

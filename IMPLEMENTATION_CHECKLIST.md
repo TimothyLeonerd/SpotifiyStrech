@@ -12,6 +12,8 @@
 - Linux GTK/PulseAudio app remains the working baseline.
 - Windows Qt Widgets port is in progress.
 - Shared transport and loop logic should be reused from `core.c` wherever Linux and Windows need the same behavior.
+- The canonical Windows status file is `WINDOWS_PORT_STATUS.md`; keep it current with every behavior change.
+- The shared Recorder refactor plan is `SHARED_RECORDER_REFACTOR_PLAN.md`; use it for architectural direction.
 
 ## Phase 2: Capture and Buffering
 
@@ -63,6 +65,16 @@
 - Test custom loop: create a region, play through the end, confirm it wraps to the region start.
 - Test loop off: disable loop during playback and confirm playback continues forward without cursor jumps.
 - Test marker drag during playback and confirm the playhead/audio do not jump merely because the marker moved.
+
+## Windows Parity Rule
+
+- If a Windows transport path needs a new concept that Linux does not have, stop and document why.
+- Prefer matching Linux stop/seek/restart behavior over patching the active playback stream in place.
+- Do not let UI refresh code rewrite cursor state unless it is a direct backend sync.
+- Any Windows playback path that bypasses the Linux cursor/loop model should be considered incomplete.
+- WASAPI queued bytes are not the same as audible playback position; Windows UI should display an audible-position estimate.
+- Windows speed parity requires the same Rubber Band prepared-buffer pipeline as Linux, not a UI-only speed value.
+- Long term, GTK and Qt should share the same Recorder/controller state owner rather than keeping parallel transport state in UI code.
 
 ## Porting Reminder
 

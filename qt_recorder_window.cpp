@@ -7,32 +7,53 @@
 #include <QPaintEvent>
 #include <QPainter>
 #include <QPalette>
+#include <QMouseEvent>
 #include <QProgressBar>
 #include <QPushButton>
 #include <QSlider>
 #include <QTimer>
+#include <QMetaObject>
 
 #include <algorithm>
 #include <cstdint>
 #include <cmath>
-#include <string>
-#include <vector>
+#include <chrono>
+#include <thread>
+
+#ifdef _WIN32
+#include <mmreg.h>
+#endif
 
 namespace {
-AppMode toAppMode(RecorderMode mode) {
-  switch (mode) {
-    case RecorderMode::Recording: return MODE_RECORDING;
-    case RecorderMode::Preparing: return MODE_PREPARING;
-    case RecorderMode::Playing: return MODE_PLAYING;
-    case RecorderMode::Paused: return MODE_PAUSED;
-    case RecorderMode::Rendering: return MODE_RENDERING;
-    case RecorderMode::Idle:
-    default: return MODE_IDLE;
-  }
-}
+gint64 nowUs() {
+  using namespace std::chrono;
+  return duration_cast<microseconds>(steady_clock::now().time_since_epoch()).count();
 }
 
-WaveformWidget::WaveformWidget(QWidget *parent) : QWidget(parent) {
+double mouseX(const QMouseEvent *event) {
+#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
+  return event->position().x();
+#else
+  return event->localPos().x();
+#endif
+}
+}  // namespace
+
+class JumpSlider : public QSlider {
+ public:
+  using QSlider::QSlider;
+
+ protected:
+  void mousePressEvent(QMouseEvent *event) override {
+    if (orientation() == Qt::Horizontal && event->button() == Qt::LeftButton && width() > 0) {
+      const double ratio = std::clamp(mouseX(event) / static_cast<double>(width()), 0.0, 1.0);
+      setValue(minimum() + static_cast<int>(std::round(ratio * (maximum() - minimum()))));
+    }
+    QSlider::mousePressEvent(event);
+  }
+};
+
+WaveformWidget::WaveformWidget(RecorderWindow *owner, QWidget *parent) : QWidget(parent), owner_(owner) {
   setMinimumHeight(280);
   setAutoFillBackground(true);
   peaks_.reserve(480);
@@ -111,7 +132,33 @@ void WaveformWidget::paintEvent(QPaintEvent *event) {
   painter.drawLine(playhead_ratio_ * r.width(), 0, playhead_ratio_ * r.width(), r.height());
 }
 
+void WaveformWidget::mousePressEvent(QMouseEvent *event) {
+  if (owner_ && owner_->waveformMousePress(mouseX(event), width(), event->modifiers())) {
+    event->accept();
+    return;
+  }
+  QWidget::mousePressEvent(event);
+}
+
+void WaveformWidget::mouseMoveEvent(QMouseEvent *event) {
+  if (owner_ && owner_->waveformMouseMove(mouseX(event), width(), event->buttons())) {
+    event->accept();
+    return;
+  }
+  QWidget::mouseMoveEvent(event);
+}
+
+void WaveformWidget::mouseReleaseEvent(QMouseEvent *event) {
+  if (owner_ && owner_->waveformMouseRelease(mouseX(event), width())) {
+    event->accept();
+    return;
+  }
+  QWidget::mouseReleaseEvent(event);
+}
+
 RecorderWindow::RecorderWindow(QWidget *parent) : QMainWindow(parent) {
+  recorder_core_init(&recorder_, nowUs());
+
   setWindowTitle(QStringLiteral("Spotify Audio Recorder"));
   resize(1100, 720);
 
@@ -119,6 +166,7 @@ RecorderWindow::RecorderWindow(QWidget *parent) : QMainWindow(parent) {
   windows_audio_context_.adapters.backend.user_data = &windows_audio_context_;
   windows_audio_context_.adapters.backend.audio_user_data = &windows_audio_context_;
   windows_audio_context_.adapters.audio = windows_audio_backend_vtable();
+  windows_audio_context_.recorder_core = &recorder_;
 #endif
 
   central_ = new QWidget(this);
@@ -155,7 +203,7 @@ RecorderWindow::RecorderWindow(QWidget *parent) : QMainWindow(parent) {
   speed_row->setSpacing(10);
 
   auto *speed_label = new QLabel(QStringLiteral("Playback speed"), central_);
-  speed_slider_ = new QSlider(Qt::Horizontal, central_);
+  speed_slider_ = new JumpSlider(Qt::Horizontal, central_);
   speed_slider_->setRange(50, 200);
   speed_slider_->setValue(100);
   speed_slider_->setMinimumWidth(320);
@@ -166,8 +214,7 @@ RecorderWindow::RecorderWindow(QWidget *parent) : QMainWindow(parent) {
   speed_row->addWidget(speed_slider_, 1);
   speed_row->addWidget(speed_value_label_);
 
-  waveform_ = new WaveformWidget(central_);
-  setDefaultLoopRegion();
+  waveform_ = new WaveformWidget(this, central_);
 
   time_label_ = new QLabel(QStringLiteral("0.0 / 0.0s"), central_);
   status_label_ = new QLabel(QStringLiteral("Idle | 0.0s captured"), central_);
@@ -199,7 +246,7 @@ RecorderWindow::RecorderWindow(QWidget *parent) : QMainWindow(parent) {
   connect(record_button_, &QPushButton::clicked, this, [this]() {
 #ifdef _WIN32
     const bool capture_running = windows_audio_backend_has_capture(windows_audio_context_.adapters.backend.audio_user_data) != 0;
-    const CoreTransportDecision decision = core_transport_decision(toAppMode(controller_.mode()), FALSE, capture_running, TRANSPORT_ACTION_RECORD);
+    const CoreTransportDecision decision = recorder_core_transport_decision(&recorder_, capture_running, TRANSPORT_ACTION_RECORD);
     bool started = false;
 
     if (decision.plan.should_stop_playback && windows_audio_context_.adapters.audio && windows_audio_context_.adapters.audio->stop_playback) {
@@ -208,20 +255,24 @@ RecorderWindow::RecorderWindow(QWidget *parent) : QMainWindow(parent) {
     if (decision.plan.should_start && windows_audio_context_.adapters.audio && windows_audio_context_.adapters.audio->start_capture) {
       started = windows_audio_context_.adapters.audio->start_capture(windows_audio_context_.adapters.backend.audio_user_data, decision.plan.reset_buffers) != 0;
     }
-    if (started) {
-      controller_.record();
-    } else if (decision.plan.should_start) {
-      controller_.stop();
-    }
+    recorder_core_apply_record_result(&recorder_, &decision.plan, started ? TRUE : FALSE, nowUs());
 #else
-    controller_.record();
+    CoreTransportPlan plan = {0};
+    plan.should_start = TRUE;
+    recorder_core_apply_record_result(&recorder_, &plan, TRUE, nowUs());
 #endif
-    syncFromController();
+    syncUi();
   });
 
   connect(stop_button_, &QPushButton::clicked, this, [this]() {
+    const gboolean capture_running =
 #ifdef _WIN32
-    const CoreTransportDecision decision = core_transport_decision(toAppMode(controller_.mode()), FALSE, windows_audio_backend_has_capture(windows_audio_context_.adapters.backend.audio_user_data) != 0, TRANSPORT_ACTION_STOP);
+      windows_audio_backend_has_capture(windows_audio_context_.adapters.backend.audio_user_data) != 0;
+#else
+      FALSE;
+#endif
+    const CoreTransportDecision decision = recorder_core_transport_decision(&recorder_, capture_running, TRANSPORT_ACTION_STOP);
+#ifdef _WIN32
     if (decision.plan.should_stop_playback && windows_audio_context_.adapters.audio && windows_audio_context_.adapters.audio->stop_playback) {
       windows_audio_context_.adapters.audio->stop_playback(windows_audio_context_.adapters.backend.audio_user_data, !decision.plan.preserve_cursor);
     }
@@ -229,63 +280,67 @@ RecorderWindow::RecorderWindow(QWidget *parent) : QMainWindow(parent) {
       windows_audio_context_.adapters.audio->stop_capture(windows_audio_context_.adapters.backend.audio_user_data, TRUE);
     }
 #endif
-    if (decision.plan.preserve_cursor) {
-      controller_.setMode(RecorderMode::Idle);
-    } else {
-      controller_.stop();
-    }
-    syncFromController();
+    recorder_core_apply_stop_plan(&recorder_, &decision.plan, nowUs());
+    syncUi();
   });
 
   connect(play_pause_button_, &QPushButton::clicked, this, [this]() {
 #ifdef _WIN32
     const bool capture_running = windows_audio_backend_has_capture(windows_audio_context_.adapters.backend.audio_user_data) != 0;
     const bool playback_active = windows_audio_backend_has_playback(windows_audio_context_.adapters.backend.audio_user_data) != 0;
-    const CoreTransportDecision decision = core_transport_decision(toAppMode(controller_.mode()), FALSE, capture_running, TRANSPORT_ACTION_PLAY_PAUSE);
-    bool started = false;
+    const CoreTransportDecision decision = recorder_core_transport_decision(&recorder_, capture_running, TRANSPORT_ACTION_PLAY_PAUSE);
 
     switch (decision.play_pause_action) {
       case CORE_PLAY_PAUSE_START_FROM_IDLE:
         if (capture_running && windows_audio_context_.adapters.audio && windows_audio_context_.adapters.audio->stop_capture) {
           windows_audio_context_.adapters.audio->stop_capture(windows_audio_context_.adapters.backend.audio_user_data, FALSE);
         }
-        if (windows_audio_context_.adapters.audio && windows_audio_context_.adapters.audio->start_playback) {
-          started = windows_audio_context_.adapters.audio->start_playback(windows_audio_context_.adapters.backend.audio_user_data) != 0;
-        }
-        controller_.setMode(started ? RecorderMode::Playing : RecorderMode::Idle);
+        recorder_core_prepare_play_from_idle(&recorder_, nowUs());
+        startWindowsPreparePlayback(true, MODE_IDLE);
         break;
       case CORE_PLAY_PAUSE_PAUSE:
         if (playback_active && windows_audio_context_.adapters.audio && windows_audio_context_.adapters.audio->stop_playback) {
           windows_audio_context_.adapters.audio->stop_playback(windows_audio_context_.adapters.backend.audio_user_data, FALSE);
         }
-        controller_.setMode(RecorderMode::Paused);
+        recorder_core_apply_play_pause_action(&recorder_, decision.play_pause_action, nowUs());
         break;
       case CORE_PLAY_PAUSE_RESUME:
-        if (windows_audio_context_.adapters.audio && windows_audio_context_.adapters.audio->start_playback) {
-          started = windows_audio_context_.adapters.audio->start_playback(windows_audio_context_.adapters.backend.audio_user_data) != 0;
-        }
-        controller_.setMode(started ? RecorderMode::Playing : RecorderMode::Paused);
+        startWindowsPreparePlayback(true, MODE_PAUSED);
         break;
       case CORE_PLAY_PAUSE_TOGGLE_RENDER_INTENT:
+        recorder_core_toggle_render_intent(&recorder_);
+        break;
       case CORE_PLAY_PAUSE_IGNORED:
       default:
         break;
     }
 #else
-    controller_.playPause();
+    recorder_core_apply_play_pause_action(&recorder_, core_transport_play_pause_action(mode_), nowUs());
 #endif
-    syncFromController();
+    syncUi();
   });
 
   connect(loop_button_, &QPushButton::toggled, this, [this](bool checked) {
-    controller_.toggleLoop(checked);
-    setDefaultLoopRegion();
-    syncFromController();
+    loop_enabled_ = checked;
+    syncWindowsLoopState();
+    syncUi();
   });
 
   connect(speed_slider_, &QSlider::valueChanged, this, [this](int value) {
-    controller_.setSpeed(value / 100.0);
-    syncFromController();
+    speed_ = value / 100.0;
+#ifdef _WIN32
+    if (!speed_slider_->isSliderDown()) {
+      commitWindowsSpeedChange();
+    }
+#endif
+    syncUi();
+  });
+
+  connect(speed_slider_, &QSlider::sliderReleased, this, [this]() {
+#ifdef _WIN32
+    commitWindowsSpeedChange();
+#endif
+    syncUi();
   });
 
   auto *ticker = new QTimer(this);
@@ -294,15 +349,335 @@ RecorderWindow::RecorderWindow(QWidget *parent) : QMainWindow(parent) {
 #ifdef _WIN32
     refreshFromWindowsBackend();
 #else
-    controller_.tick(0.033);
-    syncFromController();
+    tickState(0.033);
+    syncUi();
 #endif
   });
   ticker->start();
 
-  controller_.setCapturedFrames(0.0);
-  setDefaultLoopRegion();
-  syncFromController();
+  resetPlayhead(0.0);
+  setCapturedFrames(0.0);
+  syncUi();
+}
+
+RecorderWindow::~RecorderWindow() {
+#ifdef _WIN32
+  windows_audio_backend_destroy(&windows_audio_context_);
+#endif
+  recorder_core_dispose(&recorder_);
+}
+
+void RecorderWindow::setMode(AppMode mode) {
+  recorder_core_set_mode(&recorder_, mode);
+}
+
+void RecorderWindow::setCapturedFrames(gdouble frames) {
+  recorder_core_set_captured_frames(&recorder_, frames);
+}
+
+void RecorderWindow::setSampleRate(gdouble rate) {
+  recorder_core_set_sample_rate(&recorder_, rate);
+}
+
+gdouble RecorderWindow::capturedFrames() const {
+  return recorder_core_captured_frames(&recorder_);
+}
+
+gdouble RecorderWindow::sampleRate() const {
+  return recorder_core_sample_rate(&recorder_);
+}
+
+void RecorderWindow::setLoopRegion(gdouble start_frames, gdouble end_frames, gboolean set) {
+  recorder_core_set_loop_region(&recorder_, start_frames, end_frames, set);
+  syncWindowsLoopState();
+}
+
+void RecorderWindow::syncWindowsLoopState() {
+#ifdef _WIN32
+  windows_audio_backend_set_loop_state(windows_audio_context_.adapters.backend.audio_user_data,
+                                       loop_enabled_ ? TRUE : FALSE,
+                                       loop_region_set_,
+                                       loop_start_frames_,
+                                       loop_end_frames_);
+#endif
+}
+
+void RecorderWindow::startWindowsPreparePlayback(bool restart_playback, AppMode fallback_mode) {
+#ifdef _WIN32
+  const unsigned int generation = recorder_core_begin_render(&recorder_, nowUs());
+  progress_bar_->setRange(0, 1000);
+  progress_bar_->setValue(0);
+  progress_bar_->setVisible(true);
+  syncUi();
+
+  std::thread([this, generation, restart_playback, fallback_mode]() {
+    unsigned char *pcm = nullptr;
+    size_t pcm_len = 0;
+    void *format = nullptr;
+    uint64_t captured_frames = 0;
+    bool prepared = false;
+
+    if (windows_audio_backend_snapshot(&windows_audio_context_,
+                                       &pcm,
+                                       &pcm_len,
+                                       &format,
+                                       nullptr,
+                                       nullptr,
+                                       nullptr,
+                                       nullptr,
+                                       nullptr,
+                                       nullptr,
+                                       &captured_frames)) {
+      prepared = windows_audio_backend_prepare_playback_buffer_from_source(windows_audio_context_.adapters.backend.audio_user_data,
+                                                                          pcm,
+                                                                          pcm_len,
+                                                                          format,
+                                                                          captured_frames,
+                                                                          speed_) != 0;
+    }
+    free(pcm);
+    free(format);
+    QMetaObject::invokeMethod(this, [this, generation, restart_playback, fallback_mode, prepared]() {
+      finishWindowsPreparePlayback(generation, restart_playback, fallback_mode, prepared);
+    }, Qt::QueuedConnection);
+  }).detach();
+#else
+  (void)restart_playback;
+  (void)fallback_mode;
+#endif
+}
+
+void RecorderWindow::finishWindowsPreparePlayback(unsigned int generation, bool restart_playback, AppMode fallback_mode, bool prepared) {
+#ifdef _WIN32
+  bool started = false;
+  progress_bar_->setRange(0, 1000);
+  progress_bar_->setValue(0);
+
+  if (prepared && restart_playback && windows_audio_context_.adapters.audio && windows_audio_context_.adapters.audio->start_playback) {
+    started = windows_audio_context_.adapters.audio->start_playback(windows_audio_context_.adapters.backend.audio_user_data) != 0;
+  }
+
+  if (!recorder_core_finish_render(&recorder_, generation, prepared, restart_playback, started, fallback_mode)) {
+    return;
+  }
+
+  syncUi();
+#else
+  (void)generation;
+  (void)restart_playback;
+  (void)fallback_mode;
+  (void)prepared;
+#endif
+}
+
+void RecorderWindow::commitWindowsSpeedChange() {
+#ifdef _WIN32
+  const bool playback_active = windows_audio_backend_has_playback(windows_audio_context_.adapters.backend.audio_user_data) != 0;
+  const bool should_prepare = playback_active || mode_ == MODE_PAUSED || mode_ == MODE_IDLE;
+
+  if (playback_active && windows_audio_context_.adapters.audio && windows_audio_context_.adapters.audio->stop_playback) {
+    windows_audio_context_.adapters.audio->stop_playback(windows_audio_context_.adapters.backend.audio_user_data, FALSE);
+  }
+  if (should_prepare) {
+    startWindowsPreparePlayback(playback_active, playback_active ? MODE_PAUSED : mode_);
+  }
+#endif
+}
+
+void RecorderWindow::resetPlayhead(gdouble frames) {
+  recorder_core_reset_playhead(&recorder_, frames, nowUs());
+}
+
+void RecorderWindow::seekFraction(gdouble fraction) {
+  if (fraction < 0.0) fraction = 0.0;
+  if (fraction > 1.0) fraction = 1.0;
+
+  const gdouble target_frames = core_compute_target_frames(capturedFrames(), fraction);
+  const bool playback_active =
+#ifdef _WIN32
+    windows_audio_backend_has_playback(windows_audio_context_.adapters.backend.audio_user_data) != 0;
+#else
+    false;
+#endif
+
+#ifdef _WIN32
+  if (playback_active && !waveform_scrubbing_ && windows_audio_context_.adapters.audio && windows_audio_context_.adapters.audio->stop_playback) {
+    windows_audio_context_.adapters.audio->stop_playback(windows_audio_context_.adapters.backend.audio_user_data, FALSE);
+  }
+#endif
+
+  recorder_core_seek_fraction(&recorder_, fraction, FALSE);
+#ifdef _WIN32
+  windows_audio_backend_seek_playback_frames(windows_audio_context_.adapters.backend.audio_user_data, target_frames);
+  if (waveform_scrubbing_) {
+    return;
+  }
+  if (playback_active && !waveform_scrubbing_ && windows_audio_context_.adapters.audio && windows_audio_context_.adapters.audio->start_playback) {
+    startWindowsPreparePlayback(true, MODE_PAUSED);
+  }
+#endif
+}
+
+gdouble RecorderWindow::loopMinWidthFrames() const {
+  return recorder_core_loop_min_width_frames(&recorder_);
+}
+
+gdouble RecorderWindow::waveformFraction(double x, double width) const {
+  if (width <= 0.0) {
+    return 0.0;
+  }
+  double fraction = x / width;
+  if (fraction < 0.0) fraction = 0.0;
+  if (fraction > 1.0) fraction = 1.0;
+  return fraction;
+}
+
+bool RecorderWindow::waveformMousePress(double x, double width, Qt::KeyboardModifiers modifiers) {
+  const gdouble total_frames = capturedFrames();
+  if (width <= 0.0 || total_frames <= 0.0) {
+    return false;
+  }
+
+  const gdouble fraction = waveformFraction(x, width);
+  const gdouble target_frames = core_compute_target_frames(total_frames, fraction);
+  const gdouble handle_window = std::max(loopMinWidthFrames() * 0.25, total_frames * 10.0 / width);
+  const gboolean shift = (modifiers & Qt::ShiftModifier) != 0;
+
+  const CoreWaveformPressAction press_action = recorder_core_resolve_waveform_press(&recorder_,
+                                                                                    target_frames,
+                                                                                    handle_window,
+                                                                                    shift);
+
+  switch (press_action) {
+    case CORE_WAVEFORM_PRESS_LOOP_CREATE:
+      recorder_core_begin_loop_drag(&recorder_, press_action, target_frames);
+      syncWindowsLoopState();
+      syncUi();
+      return true;
+    case CORE_WAVEFORM_PRESS_LOOP_START:
+      recorder_core_begin_loop_drag(&recorder_, press_action, target_frames);
+      syncWindowsLoopState();
+      syncUi();
+      return true;
+    case CORE_WAVEFORM_PRESS_LOOP_END:
+      recorder_core_begin_loop_drag(&recorder_, press_action, target_frames);
+      syncWindowsLoopState();
+      syncUi();
+      return true;
+    case CORE_WAVEFORM_PRESS_SCRUB:
+      if (recorder_core_begin_scrub(&recorder_, nullptr)) {
+#ifdef _WIN32
+        if (waveform_resume_after_scrub_ && windows_audio_context_.adapters.audio && windows_audio_context_.adapters.audio->stop_playback) {
+          windows_audio_context_.adapters.audio->stop_playback(windows_audio_context_.adapters.backend.audio_user_data, FALSE);
+        }
+#endif
+      }
+      seekFraction(fraction);
+      syncUi();
+      return true;
+    case CORE_WAVEFORM_PRESS_RENDER_SEEK:
+    case CORE_WAVEFORM_PRESS_IGNORE:
+    default:
+      return false;
+  }
+}
+
+bool RecorderWindow::waveformMouseMove(double x, double width, Qt::MouseButtons buttons) {
+  if (waveform_drag_mode_ == LOOP_DRAG_NONE) {
+    if (!waveform_scrubbing_ || !(buttons & Qt::LeftButton) || mode_ != MODE_PLAYING) {
+      return false;
+    }
+    seekFraction(waveformFraction(x, width));
+    syncUi();
+    return true;
+  }
+
+  const gdouble total_frames = capturedFrames();
+  if (width <= 0.0 || total_frames <= 0.0) {
+    return false;
+  }
+
+  const gdouble current_frames = core_compute_target_frames(total_frames, waveformFraction(x, width));
+  if (recorder_core_update_loop_drag(&recorder_, current_frames)) {
+    syncWindowsLoopState();
+    waveform_->setLoopRegion(loopStartRatio(), loopEndRatio(), loop_enabled_ || loop_region_set_);
+    syncUi();
+    return true;
+  }
+
+  return false;
+}
+
+bool RecorderWindow::waveformMouseRelease(double x, double width) {
+  if (waveform_drag_mode_ == LOOP_DRAG_NONE) {
+    if (!waveform_scrubbing_) {
+      return false;
+    }
+    const gboolean resume = recorder_core_end_scrub(&recorder_);
+    if (resume) {
+#ifdef _WIN32
+      startWindowsPreparePlayback(true, MODE_PAUSED);
+#endif
+    }
+    syncUi();
+    return true;
+  }
+
+  const gdouble total_frames = capturedFrames();
+  if (width <= 0.0 || total_frames <= 0.0) {
+    waveform_drag_mode_ = LOOP_DRAG_NONE;
+    return false;
+  }
+
+  const gdouble current_frames = core_compute_target_frames(total_frames, waveformFraction(x, width));
+  recorder_core_update_loop_drag(&recorder_, current_frames);
+  recorder_core_clear_loop_drag(&recorder_);
+  syncWindowsLoopState();
+  waveform_->setLoopRegion(loopStartRatio(), loopEndRatio(), loop_enabled_ || loop_region_set_);
+  syncUi();
+  return true;
+}
+
+void RecorderWindow::tickState(gdouble elapsed_seconds) {
+  recorder_core_tick(&recorder_, elapsed_seconds, nowUs());
+}
+
+CoreUiState RecorderWindow::uiState() const {
+  const CoreUiState core_state = core_build_ui_state(mode_, FALSE);
+  CoreUiState state;
+  state.record_enabled = core_state.record_enabled;
+  state.play_pause_enabled = core_state.play_pause_enabled;
+  state.loop_enabled = core_state.loop_enabled;
+  state.stop_enabled = core_state.stop_enabled;
+  state.play_pause_label = core_state.play_pause_label ? core_state.play_pause_label : "";
+  return state;
+}
+
+CoreStatusState RecorderWindow::statusState() const {
+  CoreStatusState state;
+  const CoreStatusState core_state = core_build_status_state(mode_,
+                                                             capturedSeconds(),
+                                                             nullptr,
+                                                             loop_enabled_,
+                                                             loop_region_set_);
+  std::snprintf(state.text, sizeof(state.text), "%s", core_state.text);
+  return state;
+}
+
+gdouble RecorderWindow::playheadRatio() const {
+  return recorder_core_playhead_ratio(&recorder_);
+}
+
+gdouble RecorderWindow::capturedSeconds() const {
+  return recorder_core_captured_seconds(&recorder_);
+}
+
+gdouble RecorderWindow::loopStartRatio() const {
+  return recorder_core_loop_start_ratio(&recorder_);
+}
+
+gdouble RecorderWindow::loopEndRatio() const {
+  return recorder_core_loop_end_ratio(&recorder_);
 }
 
 void RecorderWindow::refreshWaveform() {
@@ -326,22 +701,24 @@ void RecorderWindow::refreshWaveform() {
                                      &playback_total_bytes,
                                      &wave_peaks,
                                      &wave_peak_count,
-                                     &captured_frames)) {
+                                      &captured_frames)) {
     const auto *format = static_cast<WAVEFORMATEX *>(format_ptr);
     QVector<int> qt_peaks;
     const double sample_rate = (format && format->nSamplesPerSec > 0)
                                  ? static_cast<double>(format->nSamplesPerSec)
                                  : 44100.0;
-    const RecorderMode backend_mode = capture_active ? RecorderMode::Recording
-                                                     : (playback_active ? RecorderMode::Playing : RecorderMode::Idle);
+    const size_t bytes_per_frame = (format && format->nBlockAlign > 0) ? format->nBlockAlign : 4;
+    (void)capture_active;
 
-    controller_.setSampleRate(sample_rate);
-    controller_.setCapturedFrames(static_cast<double>(captured_frames));
-    controller_.setMode(backend_mode);
+    setSampleRate(sample_rate);
+    setCapturedFrames(static_cast<gdouble>(captured_frames));
     if (playback_active && playback_total_bytes > 0) {
-      controller_.seekFraction(static_cast<double>(playback_cursor_bytes) / static_cast<double>(playback_total_bytes));
-    } else if (!capture_active && !playback_active) {
-      controller_.seekFraction(0.0);
+      const gdouble cursor_frames = static_cast<gdouble>(playback_cursor_bytes) / static_cast<gdouble>(bytes_per_frame);
+      core_set_playback_cursor_state(cursor_frames,
+                                     &playback_cursor_frames_,
+                                     &playback_anchor_frames_,
+                                     &playback_anchor_us_,
+                                     &display_playhead_frames_);
     }
 
     if (wave_peaks && wave_peak_count > 0) {
@@ -353,19 +730,14 @@ void RecorderWindow::refreshWaveform() {
 
     waveform_->setPeakScale(32768.0);
     waveform_->setPeaks(qt_peaks);
-    waveform_->setPlayheadRatio(controller_.playheadRatio());
+    waveform_->setPlayheadRatio(playheadRatio());
     waveform_->update();
   }
   free(format_ptr);
   free(wave_peaks);
   return;
 #endif
-  const std::vector<int> peaks = controller_.waveformPeaks();
   QVector<int> qt_peaks;
-  qt_peaks.reserve(static_cast<int>(peaks.size()));
-  for (int peak : peaks) {
-    qt_peaks.push_back(peak);
-  }
   waveform_->setPeakScale(100.0);
   waveform_->setPeaks(qt_peaks);
   waveform_->update();
@@ -373,42 +745,53 @@ void RecorderWindow::refreshWaveform() {
 
 void RecorderWindow::refreshFromWindowsBackend() {
 #ifdef _WIN32
+  if (windows_rendering_) {
+    gdouble progress = 0.0;
+    int active = 0;
+    if (windows_audio_backend_render_progress(windows_audio_context_.adapters.backend.audio_user_data, &progress, &active)) {
+      if (progress < 0.0) progress = 0.0;
+      if (progress > 1.0) progress = 1.0;
+      progress_bar_->setRange(0, 1000);
+      progress_bar_->setValue(static_cast<int>(progress * 1000.0));
+      (void)active;
+    }
+    syncUi();
+    return;
+  }
   refreshWaveform();
-  syncFromController();
+  syncUi();
 #endif
 }
 
 void RecorderWindow::updateSpeedLabel() {
-  speed_value_label_->setText(QString::number(controller_.speed(), 'f', 1) + QStringLiteral("x"));
+  speed_value_label_->setText(QString::number(speed_, 'f', 1) + QStringLiteral("x"));
 }
 
 void RecorderWindow::updatePlayPauseLabel() {
-  play_pause_button_->setText(controller_.uiState().play_pause_label.empty()
+  const CoreUiState ui = core_build_ui_state(mode_, FALSE);
+  play_pause_button_->setText(!ui.play_pause_label || !ui.play_pause_label[0]
                                 ? QStringLiteral("Play")
-                                : QString::fromStdString(controller_.uiState().play_pause_label));
+                                : QString::fromLatin1(ui.play_pause_label));
 }
 
-void RecorderWindow::setDefaultLoopRegion() {
-}
-
-void RecorderWindow::syncFromController() {
-  const auto ui = controller_.uiState();
-  const auto status = controller_.statusState();
+void RecorderWindow::syncUi() {
+  const CoreUiState ui = uiState();
+  const CoreStatusState status = statusState();
 
   record_button_->setEnabled(ui.record_enabled);
   play_pause_button_->setEnabled(ui.play_pause_enabled);
   loop_button_->setEnabled(ui.loop_enabled);
   stop_button_->setEnabled(ui.stop_enabled);
-  progress_bar_->setVisible(controller_.mode() != RecorderMode::Idle);
-  status_label_->setText(QString::fromStdString(status.text));
-  const double total_seconds = controller_.capturedSeconds();
-  const double play_seconds = controller_.playheadRatio() * total_seconds;
+  progress_bar_->setVisible(windows_rendering_ || mode_ != MODE_IDLE);
+  status_label_->setText(QString::fromLatin1(status.text));
+  const double total_seconds = capturedSeconds();
+  const double play_seconds = playheadRatio() * total_seconds;
   time_label_->setText(QString::number(play_seconds, 'f', 1) + QStringLiteral(" / ") + QString::number(total_seconds, 'f', 1) + QStringLiteral("s"));
-  speed_value_label_->setText(QString::number(controller_.speed(), 'f', 1) + QStringLiteral("x"));
-  play_pause_button_->setText(QString::fromStdString(ui.play_pause_label));
-  loop_button_->setChecked(controller_.loopEnabled());
-  waveform_->setLoopRegion(controller_.loopStartRatio(), controller_.loopEndRatio(), controller_.loopEnabled());
-  waveform_->setPlayheadRatio(controller_.playheadRatio());
+  speed_value_label_->setText(QString::number(speed_, 'f', 1) + QStringLiteral("x"));
+  play_pause_button_->setText(QString::fromLatin1(ui.play_pause_label));
+  loop_button_->setChecked(loop_enabled_);
+  waveform_->setLoopRegion(loopStartRatio(), loopEndRatio(), loop_enabled_ || loop_region_set_);
+  waveform_->setPlayheadRatio(playheadRatio());
 #ifndef _WIN32
   refreshWaveform();
 #endif
