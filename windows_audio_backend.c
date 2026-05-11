@@ -657,6 +657,57 @@ static BOOL windows_audio_append_locked(WindowsAudioBackendState *state, const B
   return TRUE;
 }
 
+static BOOL windows_audio_append_capture_bytes_locked(PlatformWindowsContext *context,
+                                                     WindowsAudioBackendState *state,
+                                                     const BYTE *data,
+                                                     UINT32 frames,
+                                                     const WAVEFORMATEX *format) {
+  UINT32 bytes;
+  BOOL appended;
+
+  if (!state || !data || !format || frames == 0 || format->nBlockAlign == 0) {
+    return FALSE;
+  }
+
+  bytes = frames * format->nBlockAlign;
+  appended = context && context->recorder_core
+    ? recorder_core_append_pcm(context->recorder_core, data, bytes, frames)
+    : windows_audio_append_locked(state, data, bytes);
+  if (!appended) {
+    return FALSE;
+  }
+
+  windows_audio_append_peaks_for_buffer_locked(state, data, bytes, format);
+  state->captured_frames += frames;
+  if (context && context->recorder_core) {
+    recorder_core_set_sample_rate(context->recorder_core, format->nSamplesPerSec);
+    context->recorder_core->audio.channels = format->nChannels;
+  }
+  return TRUE;
+}
+
+static BOOL windows_audio_append_silence_locked(PlatformWindowsContext *context,
+                                               WindowsAudioBackendState *state,
+                                               UINT32 frames,
+                                               const WAVEFORMATEX *format) {
+  UINT32 bytes;
+  BYTE *silence;
+  BOOL appended;
+
+  if (!format || frames == 0 || format->nBlockAlign == 0) {
+    return FALSE;
+  }
+
+  bytes = frames * format->nBlockAlign;
+  silence = (BYTE *)calloc(1, bytes);
+  if (!silence) {
+    return FALSE;
+  }
+  appended = windows_audio_append_capture_bytes_locked(context, state, silence, frames, format);
+  free(silence);
+  return appended;
+}
+
 static HRESULT windows_audio_get_mix_format(IAudioClient *client, WAVEFORMATEX **format) {
   if (!client || !format) {
     return E_POINTER;
@@ -717,7 +768,8 @@ static DWORD WINAPI windows_capture_thread(LPVOID param) {
   IAudioCaptureClient *capture_client = NULL;
   WAVEFORMATEX *format = NULL;
   WAVEFORMATEX *capture_format = NULL;
-  UINT32 bytes_per_frame = 0;
+  ULONGLONG last_append_ms = 0;
+  double silence_frame_remainder = 0.0;
   HANDLE mm_task = NULL;
   HRESULT hr;
 
@@ -743,8 +795,6 @@ static DWORD WINAPI windows_capture_thread(LPVOID param) {
     goto cleanup;
   }
 
-  bytes_per_frame = format->nBlockAlign;
-
   hr = IAudioClient_GetService(client, &kIID_IAudioCaptureClient, (void **)&capture_client);
   if (FAILED(hr)) {
     goto cleanup;
@@ -767,6 +817,7 @@ static DWORD WINAPI windows_capture_thread(LPVOID param) {
   capture_format = state->wave_format;
   format = NULL;
   state->capture_active = TRUE;
+  last_append_ms = GetTickCount64();
   LeaveCriticalSection(&state->lock);
 
   while (WaitForSingleObject(state->capture_stop_event, 10) == WAIT_TIMEOUT) {
@@ -775,44 +826,50 @@ static DWORD WINAPI windows_capture_thread(LPVOID param) {
     if (FAILED(IAudioCaptureClient_GetNextPacketSize(capture_client, &packet_length))) {
       break;
     }
+    if (packet_length == 0) {
+      ULONGLONG now_ms = GetTickCount64();
+      ULONGLONG elapsed_ms = now_ms - last_append_ms;
+      if (elapsed_ms > 0 && capture_format && capture_format->nSamplesPerSec > 0) {
+        double exact_frames = ((double)elapsed_ms * (double)capture_format->nSamplesPerSec / 1000.0) + silence_frame_remainder;
+        UINT32 silence_frames = (UINT32)exact_frames;
+        const UINT32 max_silence_frames = capture_format->nSamplesPerSec / 4;
+        if (max_silence_frames > 0 && silence_frames > max_silence_frames) {
+          silence_frames = max_silence_frames;
+        }
+        if (silence_frames > 0) {
+          const BOOL capped = max_silence_frames > 0 && silence_frames == max_silence_frames && exact_frames > (double)max_silence_frames;
+          EnterCriticalSection(&state->lock);
+          if (windows_audio_append_silence_locked(context, state, silence_frames, capture_format)) {
+            if (capped) {
+              const double appended_ms = (double)silence_frames * 1000.0 / (double)capture_format->nSamplesPerSec;
+              last_append_ms += (ULONGLONG)appended_ms;
+            } else {
+              last_append_ms = now_ms;
+            }
+            silence_frame_remainder = capped ? 0.0 : exact_frames - (double)silence_frames;
+          }
+          LeaveCriticalSection(&state->lock);
+        }
+      }
+    }
     while (packet_length > 0) {
       BYTE *data = NULL;
       UINT32 frames = 0;
       DWORD flags = 0;
-      UINT32 bytes = 0;
 
       hr = IAudioCaptureClient_GetBuffer(capture_client, &data, &frames, &flags, NULL, NULL);
       if (FAILED(hr)) {
         goto cleanup;
       }
 
-      bytes = frames * bytes_per_frame;
       EnterCriticalSection(&state->lock);
       if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
-        BYTE *silence = (BYTE *)calloc(1, bytes);
-        if (silence) {
-          if ((context->recorder_core && recorder_core_append_pcm(context->recorder_core, silence, bytes, frames)) ||
-              (!context->recorder_core && windows_audio_append_locked(state, silence, bytes))) {
-            windows_audio_append_peaks_for_buffer_locked(state, silence, bytes, capture_format);
-            state->captured_frames += frames;
-            if (context->recorder_core) {
-              recorder_core_set_sample_rate(context->recorder_core, capture_format->nSamplesPerSec);
-              context->recorder_core->audio.channels = capture_format->nChannels;
-            }
-          }
-          free(silence);
-        }
+        windows_audio_append_silence_locked(context, state, frames, capture_format);
       } else {
-        if ((context->recorder_core && recorder_core_append_pcm(context->recorder_core, data, bytes, frames)) ||
-            (!context->recorder_core && windows_audio_append_locked(state, data, bytes))) {
-          windows_audio_append_peaks_for_buffer_locked(state, data, bytes, capture_format);
-          state->captured_frames += frames;
-          if (context->recorder_core) {
-            recorder_core_set_sample_rate(context->recorder_core, capture_format->nSamplesPerSec);
-            context->recorder_core->audio.channels = capture_format->nChannels;
-          }
-        }
+        windows_audio_append_capture_bytes_locked(context, state, data, frames, capture_format);
       }
+      last_append_ms = GetTickCount64();
+      silence_frame_remainder = 0.0;
       LeaveCriticalSection(&state->lock);
 
       hr = IAudioCaptureClient_ReleaseBuffer(capture_client, frames);
