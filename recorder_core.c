@@ -58,6 +58,16 @@ gboolean recorder_core_append_pcm(RecorderCore *core, const unsigned char *data,
   if (!core || !data || bytes == 0) {
     return FALSE;
   }
+
+#ifdef CORE_HAS_GLIB
+  if (core->audio.pcm) {
+    g_byte_array_append(core->audio.pcm, data, bytes);
+    core->audio.captured_frames += frames;
+    recorder_core_invalidate_playback_buffer(core);
+    return TRUE;
+  }
+#endif
+
   if (core->portable_pcm_len > ((size_t)-1) - bytes) {
     return FALSE;
   }
@@ -468,6 +478,89 @@ void recorder_core_invalidate_playback_buffer(RecorderCore *core) {
   }
 
   core->audio.playback_valid = FALSE;
+}
+
+RecorderCoreSpeedChange recorder_core_apply_speed_change(RecorderCore *core, gdouble speed) {
+  RecorderCoreSpeedChange change = {0};
+
+  if (!core) {
+    return change;
+  }
+  if (speed <= 0.0) {
+    speed = 1.0;
+  }
+  if (core->speed == speed) {
+    return change;
+  }
+
+  change.changed = TRUE;
+  core->speed = speed;
+  recorder_core_invalidate_playback_buffer(core);
+
+  if (core->mode == MODE_RENDERING) {
+    change.cancel_render = TRUE;
+    change.cancel_next_mode = core->render_source_mode;
+    change.start_render = TRUE;
+    change.fallback_mode = core->render_source_mode;
+  } else if (core->mode == MODE_PLAYING) {
+    change.restart_playback = TRUE;
+    change.fallback_mode = MODE_PAUSED;
+  } else if (core->mode == MODE_PAUSED || core->mode == MODE_IDLE) {
+    change.start_render = TRUE;
+    change.fallback_mode = core->mode;
+  }
+
+  change.render_should_play = FALSE;
+  core->render_intent.should_play = change.render_should_play;
+  return change;
+}
+
+RecorderCorePlaybackRequest recorder_core_request_playback(RecorderCore *core,
+                                                           gboolean playback_running,
+                                                           gint64 now_us) {
+  RecorderCorePlaybackRequest request = {0};
+
+  if (!core) {
+    return request;
+  }
+
+  request.has_audio = recorder_core_captured_frames(core) > 0.0;
+  request.already_playing = playback_running;
+  request.buffer_ready = recorder_core_playback_buffer_ready(core);
+  request.render_pending = core->render_pending && core->mode == MODE_RENDERING;
+
+  if (playback_running || !request.has_audio) {
+    return request;
+  }
+
+  core->render_intent.should_play = TRUE;
+  if (request.buffer_ready) {
+    request.should_start_ready_buffer = TRUE;
+    return request;
+  }
+
+  if (request.render_pending) {
+    return request;
+  }
+
+  recorder_core_begin_render(core, now_us);
+  request.render_pending = TRUE;
+  request.should_render = TRUE;
+  return request;
+}
+
+gboolean recorder_core_begin_ready_playback(RecorderCore *core,
+                                           gboolean playback_running,
+                                           gint64 now_us) {
+  if (!core || playback_running || !recorder_core_playback_buffer_ready(core)) {
+    return FALSE;
+  }
+
+  core->mode = MODE_PREPARING;
+  core->playback_anchor_frames = core->playback_cursor_frames;
+  core->playback_anchor_us = now_us;
+  core->display_playhead_frames = core->playback_cursor_frames;
+  return TRUE;
 }
 
 guint recorder_core_begin_render(RecorderCore *core, gint64 now_us) {

@@ -611,3 +611,230 @@ gdouble core_update_display_playhead(AppMode mode,
 
   return current_frames;
 }
+
+static guint64 core_source_frame_to_output_frame(gdouble source_frame,
+                                                 guint64 base_source_frame,
+                                                 gdouble rendered_to_source_ratio,
+                                                 guint64 playback_frames) {
+  gdouble relative_source;
+  guint64 output_frame;
+
+  if (rendered_to_source_ratio <= 0.0) {
+    rendered_to_source_ratio = 1.0;
+  }
+  if (source_frame <= (gdouble)base_source_frame) {
+    return 0;
+  }
+
+  relative_source = source_frame - (gdouble)base_source_frame;
+  output_frame = (guint64)(relative_source / rendered_to_source_ratio);
+  if (output_frame > playback_frames) {
+    output_frame = playback_frames;
+  }
+  return output_frame;
+}
+
+static gdouble core_output_frame_to_source_frame(guint64 output_frame,
+                                                guint64 base_source_frame,
+                                                gdouble rendered_to_source_ratio,
+                                                guint64 total_source_frames) {
+  gdouble source_frame;
+
+  if (rendered_to_source_ratio <= 0.0) {
+    rendered_to_source_ratio = 1.0;
+  }
+  source_frame = (gdouble)base_source_frame + ((gdouble)output_frame * rendered_to_source_ratio);
+  if (source_frame > (gdouble)total_source_frames) {
+    source_frame = (gdouble)total_source_frames;
+  }
+  return source_frame;
+}
+
+void core_playback_timeline_init(CorePlaybackTimeline *timeline,
+                                 gdouble start_source_frame,
+                                 guint64 total_source_frames,
+                                 guint64 playback_frames,
+                                 gdouble rendered_to_source_ratio,
+                                 guint64 base_source_frame) {
+  if (!timeline) {
+    return;
+  }
+
+  if (rendered_to_source_ratio <= 0.0) {
+    rendered_to_source_ratio = 1.0;
+  }
+  if (start_source_frame < 0.0) {
+    start_source_frame = 0.0;
+  }
+  if (start_source_frame > (gdouble)total_source_frames) {
+    start_source_frame = (gdouble)total_source_frames;
+  }
+  if (base_source_frame > total_source_frames) {
+    base_source_frame = total_source_frames;
+  }
+
+  timeline->rendered_to_source_ratio = rendered_to_source_ratio;
+  timeline->base_source_frame = base_source_frame;
+  timeline->total_source_frames = total_source_frames;
+  timeline->playback_frames = playback_frames;
+  timeline->source_cursor_frame = start_source_frame;
+  timeline->output_cursor_frame = core_source_frame_to_output_frame(start_source_frame,
+                                                                   base_source_frame,
+                                                                   rendered_to_source_ratio,
+                                                                   playback_frames);
+  timeline->loop_valid = FALSE;
+  timeline->loop_armed = FALSE;
+  timeline->loop_wrapped = FALSE;
+  timeline->loop_start_source_frame = 0;
+  timeline->loop_end_source_frame = 0;
+  timeline->loop_start_output_frame = 0;
+  timeline->loop_end_output_frame = 0;
+}
+
+void core_playback_timeline_update_loop(CorePlaybackTimeline *timeline,
+                                        const LoopState *loop) {
+  gdouble loop_start = 0.0;
+  gdouble loop_end = 0.0;
+
+  if (!timeline) {
+    return;
+  }
+
+  timeline->loop_valid = FALSE;
+  timeline->loop_start_source_frame = 0;
+  timeline->loop_end_source_frame = 0;
+  timeline->loop_start_output_frame = 0;
+  timeline->loop_end_output_frame = 0;
+
+  if (!loop || !loop->enabled || !core_get_effective_loop_region(loop,
+                                                                 (gdouble)timeline->total_source_frames,
+                                                                 &loop_start,
+                                                                 &loop_end)) {
+    timeline->loop_armed = FALSE;
+    timeline->loop_wrapped = FALSE;
+    return;
+  }
+
+  timeline->loop_start_source_frame = (guint64)loop_start;
+  timeline->loop_end_source_frame = (guint64)loop_end;
+  if (timeline->loop_end_source_frame <= timeline->loop_start_source_frame ||
+      timeline->loop_start_source_frame < timeline->base_source_frame) {
+    timeline->loop_armed = FALSE;
+    timeline->loop_wrapped = FALSE;
+    return;
+  }
+
+  timeline->loop_start_output_frame = core_source_frame_to_output_frame((gdouble)timeline->loop_start_source_frame,
+                                                                       timeline->base_source_frame,
+                                                                       timeline->rendered_to_source_ratio,
+                                                                       timeline->playback_frames);
+  timeline->loop_end_output_frame = core_source_frame_to_output_frame((gdouble)timeline->loop_end_source_frame,
+                                                                     timeline->base_source_frame,
+                                                                     timeline->rendered_to_source_ratio,
+                                                                     timeline->playback_frames);
+  timeline->loop_valid = timeline->loop_end_output_frame > timeline->loop_start_output_frame;
+  if (!timeline->loop_valid) {
+    timeline->loop_armed = FALSE;
+    timeline->loop_wrapped = FALSE;
+    return;
+  }
+
+  if (!timeline->loop_armed && timeline->source_cursor_frame < (gdouble)timeline->loop_end_source_frame) {
+    timeline->loop_armed = TRUE;
+  } else if (!timeline->loop_armed) {
+    timeline->loop_wrapped = FALSE;
+  }
+
+  if (timeline->loop_armed &&
+      (timeline->source_cursor_frame >= (gdouble)timeline->loop_end_source_frame ||
+       timeline->output_cursor_frame >= timeline->loop_end_output_frame)) {
+    timeline->source_cursor_frame = (gdouble)timeline->loop_start_source_frame;
+    timeline->output_cursor_frame = timeline->loop_start_output_frame;
+    timeline->loop_wrapped = TRUE;
+  }
+}
+
+guint64 core_playback_timeline_limit_write_frames(CorePlaybackTimeline *timeline,
+                                                  guint64 requested_frames) {
+  guint64 remaining_frames;
+
+  if (!timeline || requested_frames == 0) {
+    return 0;
+  }
+
+  if (timeline->loop_valid && timeline->loop_armed) {
+    if (timeline->output_cursor_frame >= timeline->loop_end_output_frame) {
+      timeline->source_cursor_frame = (gdouble)timeline->loop_end_source_frame;
+      return 0;
+    }
+    remaining_frames = timeline->loop_end_output_frame - timeline->output_cursor_frame;
+  } else {
+    if (timeline->output_cursor_frame >= timeline->playback_frames) {
+      return 0;
+    }
+    remaining_frames = timeline->playback_frames - timeline->output_cursor_frame;
+  }
+
+  return requested_frames < remaining_frames ? requested_frames : remaining_frames;
+}
+
+void core_playback_timeline_advance(CorePlaybackTimeline *timeline,
+                                    guint64 written_frames) {
+  if (!timeline || written_frames == 0) {
+    return;
+  }
+
+  timeline->output_cursor_frame += written_frames;
+  if (timeline->output_cursor_frame > timeline->playback_frames) {
+    timeline->output_cursor_frame = timeline->playback_frames;
+  }
+  timeline->source_cursor_frame = core_output_frame_to_source_frame(timeline->output_cursor_frame,
+                                                                   timeline->base_source_frame,
+                                                                   timeline->rendered_to_source_ratio,
+                                                                   timeline->total_source_frames);
+
+  if (timeline->loop_valid &&
+      timeline->loop_armed &&
+      timeline->source_cursor_frame >= (gdouble)timeline->loop_end_source_frame) {
+    timeline->source_cursor_frame = (gdouble)timeline->loop_start_source_frame;
+    timeline->output_cursor_frame = timeline->loop_start_output_frame;
+    timeline->loop_wrapped = TRUE;
+  }
+}
+
+gboolean core_playback_timeline_reached_end(const CorePlaybackTimeline *timeline) {
+  return timeline &&
+    (!timeline->loop_valid || !timeline->loop_armed) &&
+    timeline->output_cursor_frame >= timeline->playback_frames;
+}
+
+guint64 core_playback_timeline_rewind_output_cursor(guint64 tail_frame,
+                                                    guint64 queued_frames,
+                                                    guint64 loop_start_frame,
+                                                    guint64 loop_end_frame,
+                                                    gboolean loop_valid,
+                                                    gboolean loop_wrapped) {
+  if (!loop_valid || !loop_wrapped) {
+    return queued_frames >= tail_frame ? 0 : tail_frame - queued_frames;
+  }
+
+  if (loop_end_frame <= loop_start_frame) {
+    return queued_frames >= tail_frame ? 0 : tail_frame - queued_frames;
+  }
+
+  {
+    const guint64 loop_len = loop_end_frame - loop_start_frame;
+    const guint64 queued_mod = queued_frames % loop_len;
+    guint64 offset;
+
+    if (tail_frame < loop_start_frame || tail_frame >= loop_end_frame) {
+      tail_frame = loop_start_frame;
+    }
+
+    offset = tail_frame - loop_start_frame;
+    if (queued_mod <= offset) {
+      return tail_frame - queued_mod;
+    }
+    return loop_end_frame - (queued_mod - offset);
+  }
+}

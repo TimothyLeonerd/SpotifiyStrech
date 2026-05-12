@@ -296,7 +296,18 @@ RecorderWindow::RecorderWindow(QWidget *parent) : QMainWindow(parent) {
           windows_audio_context_.adapters.audio->stop_capture(windows_audio_context_.adapters.backend.audio_user_data, FALSE);
         }
         recorder_core_prepare_play_from_idle(&recorder_, nowUs());
-        startWindowsPreparePlayback(true, MODE_IDLE);
+        {
+          const RecorderCorePlaybackRequest request = recorder_core_request_playback(&recorder_, playback_active ? TRUE : FALSE, nowUs());
+          if (!request.has_audio) {
+            break;
+          } else if (request.should_render) {
+            startWindowsPreparePlayback(true, MODE_IDLE, windows_render_generation_);
+          } else if (request.render_pending) {
+            syncUi();
+          } else {
+            startWindowsPreparePlayback(true, MODE_IDLE);
+          }
+        }
         break;
       case CORE_PLAY_PAUSE_PAUSE:
         if (playback_active && windows_audio_context_.adapters.audio && windows_audio_context_.adapters.audio->stop_playback) {
@@ -327,7 +338,7 @@ RecorderWindow::RecorderWindow(QWidget *parent) : QMainWindow(parent) {
   });
 
   connect(speed_slider_, &QSlider::valueChanged, this, [this](int value) {
-    speed_ = value / 100.0;
+    pending_speed_ = value / 100.0;
 #ifdef _WIN32
     if (!speed_slider_->isSliderDown()) {
       commitWindowsSpeedChange();
@@ -402,9 +413,11 @@ void RecorderWindow::syncWindowsLoopState() {
 #endif
 }
 
-void RecorderWindow::startWindowsPreparePlayback(bool restart_playback, AppMode fallback_mode) {
+void RecorderWindow::startWindowsPreparePlayback(bool restart_playback, AppMode fallback_mode, unsigned int generation) {
 #ifdef _WIN32
-  const unsigned int generation = recorder_core_begin_render(&recorder_, nowUs());
+  if (generation == 0) {
+    generation = recorder_core_begin_render(&recorder_, nowUs());
+  }
   progress_bar_->setRange(0, 1000);
   progress_bar_->setValue(0);
   progress_bar_->setVisible(true);
@@ -473,13 +486,21 @@ void RecorderWindow::finishWindowsPreparePlayback(unsigned int generation, bool 
 void RecorderWindow::commitWindowsSpeedChange() {
 #ifdef _WIN32
   const bool playback_active = windows_audio_backend_has_playback(windows_audio_context_.adapters.backend.audio_user_data) != 0;
-  const bool should_prepare = playback_active || mode_ == MODE_PAUSED || mode_ == MODE_IDLE;
+  RecorderCoreSpeedChange change = recorder_core_apply_speed_change(&recorder_, pending_speed_);
 
-  if (playback_active && windows_audio_context_.adapters.audio && windows_audio_context_.adapters.audio->stop_playback) {
+  if (!change.changed) {
+    return;
+  }
+
+  if (change.cancel_render) {
+    recorder_core_cancel_render(&recorder_, change.cancel_next_mode);
+  }
+
+  if ((playback_active || change.restart_playback) && windows_audio_context_.adapters.audio && windows_audio_context_.adapters.audio->stop_playback) {
     windows_audio_context_.adapters.audio->stop_playback(windows_audio_context_.adapters.backend.audio_user_data, FALSE);
   }
-  if (should_prepare) {
-    startWindowsPreparePlayback(playback_active, playback_active ? MODE_PAUSED : mode_);
+  if (change.start_render || change.restart_playback) {
+    startWindowsPreparePlayback(change.restart_playback, change.fallback_mode);
   }
 #endif
 }
@@ -764,7 +785,7 @@ void RecorderWindow::refreshFromWindowsBackend() {
 }
 
 void RecorderWindow::updateSpeedLabel() {
-  speed_value_label_->setText(QString::number(speed_, 'f', 1) + QStringLiteral("x"));
+  speed_value_label_->setText(QString::number(pending_speed_, 'f', 1) + QStringLiteral("x"));
 }
 
 void RecorderWindow::updatePlayPauseLabel() {
@@ -787,7 +808,7 @@ void RecorderWindow::syncUi() {
   const double total_seconds = capturedSeconds();
   const double play_seconds = playheadRatio() * total_seconds;
   time_label_->setText(QString::number(play_seconds, 'f', 1) + QStringLiteral(" / ") + QString::number(total_seconds, 'f', 1) + QStringLiteral("s"));
-  speed_value_label_->setText(QString::number(speed_, 'f', 1) + QStringLiteral("x"));
+  speed_value_label_->setText(QString::number(pending_speed_, 'f', 1) + QStringLiteral("x"));
   play_pause_button_->setText(QString::fromLatin1(ui.play_pause_label));
   loop_button_->setChecked(loop_enabled_);
   waveform_->setLoopRegion(loopStartRatio(), loopEndRatio(), loop_enabled_ || loop_region_set_);

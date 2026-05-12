@@ -316,10 +316,6 @@ static gdouble loop_min_width_frames(Recorder *r) {
   return min_width;
 }
 
-static gboolean get_effective_loop_region_locked(Recorder *r, gdouble total_frames, gdouble *start_frames, gdouble *end_frames) {
-  return core_get_effective_loop_region(&r->loop, total_frames, start_frames, end_frames);
-}
-
 static LoopSnapshot get_loop_snapshot(Recorder *r) {
   g_mutex_lock(&r->mutex);
   LoopSnapshot snapshot = recorder_core_loop_snapshot(&r->core);
@@ -677,22 +673,7 @@ static gpointer render_thread_main(gpointer data) {
   return NULL;
 }
 
-static gboolean ensure_playback_buffer(Recorder *r) {
-  g_mutex_lock(&r->mutex);
-  if (recorder_core_playback_buffer_ready(&r->core)) {
-    g_mutex_unlock(&r->mutex);
-    return TRUE;
-  }
-
-  if (r->audio.pcm->len == 0) {
-    g_mutex_unlock(&r->mutex);
-    set_error(r, "Nothing has been recorded yet");
-    return FALSE;
-  }
-
-  recorder_core_begin_render(&r->core, g_get_monotonic_time());
-  g_mutex_unlock(&r->mutex);
-
+static void start_render_worker(Recorder *r) {
   if (r->platform.ui && r->platform.ui->set_progress_visible) {
     r->platform.ui->set_progress_visible(r->platform.backend.user_data, TRUE);
   }
@@ -710,6 +691,25 @@ static gboolean ensure_playback_buffer(Recorder *r) {
   r->render_thread = g_thread_new("rubberband-render", render_thread_main, r);
 
   refresh_ui(r);
+}
+
+static gboolean ensure_playback_buffer(Recorder *r) {
+  g_mutex_lock(&r->mutex);
+  if (recorder_core_playback_buffer_ready(&r->core)) {
+    g_mutex_unlock(&r->mutex);
+    return TRUE;
+  }
+
+  if (r->audio.pcm->len == 0) {
+    g_mutex_unlock(&r->mutex);
+    set_error(r, "Nothing has been recorded yet");
+    return FALSE;
+  }
+
+  recorder_core_begin_render(&r->core, g_get_monotonic_time());
+  g_mutex_unlock(&r->mutex);
+
+  start_render_worker(r);
   return TRUE;
 }
 
@@ -720,7 +720,7 @@ static gboolean start_playback_with_ready_buffer(Recorder *r) {
     return TRUE;
   }
 
-  if (!recorder_core_playback_buffer_ready(&r->core)) {
+  if (!recorder_core_begin_ready_playback(&r->core, r->playback_running, g_get_monotonic_time())) {
     g_mutex_unlock(&r->mutex);
     set_error(r, "Playback buffer is not ready");
     return FALSE;
@@ -728,10 +728,6 @@ static gboolean start_playback_with_ready_buffer(Recorder *r) {
 
   r->playback_stop_requested = FALSE;
   r->playback_running = TRUE;
-  r->mode = MODE_PREPARING;
-  r->playback_anchor_frames = r->playback_cursor_frames;
-  r->playback_anchor_us = g_get_monotonic_time();
-  r->display_playhead_frames = r->playback_cursor_frames;
   g_mutex_unlock(&r->mutex);
 
   clear_error(r);
@@ -980,9 +976,7 @@ static gpointer capture_thread_main(gpointer user_data) {
       const guint chunk_bytes = chunk_frames * frame_size;
 
       g_mutex_lock(&rec->mutex);
-      g_byte_array_append(rec->audio.pcm, buffer, buffer_size);
-      rec->audio.captured_frames += buffer_size / (rec->audio.channels * sizeof(gint16));
-      invalidate_playback_buffer_locked(rec);
+      recorder_core_append_pcm(&rec->core, buffer, buffer_size, buffer_size / (rec->audio.channels * sizeof(gint16)));
 
       for (gsize offset = 0; offset < buffer_size; offset += chunk_bytes) {
         gsize remaining = buffer_size - offset;
@@ -1031,7 +1025,6 @@ static gpointer playback_thread_main(gpointer user_data) {
   guint sample_rate = 44100;
   guint channels = 2;
   gdouble cursor_frames = 0.0;
-  gdouble source_cursor_frame = 0.0;
   gdouble final_cursor_frames = 0.0;
   gdouble rendered_to_source_ratio = 1.0;
   gboolean loop_enabled = FALSE;
@@ -1045,7 +1038,7 @@ static gpointer playback_thread_main(gpointer user_data) {
   gboolean flush_on_exit = FALSE;
   guint64 total_frames = 0;
   guint64 playback_frames = 0;
-  guint64 output_frames_played = 0;
+  CorePlaybackTimeline timeline = {0};
   PulseQuery query = {0};
 
   g_printerr("[playback] thread started\n");
@@ -1075,15 +1068,11 @@ static gpointer playback_thread_main(gpointer user_data) {
   if (cursor_frames > (gdouble)total_frames) {
     cursor_frames = (gdouble)total_frames;
   }
-  source_cursor_frame = cursor_frames;
-  final_cursor_frames = source_cursor_frame;
-  output_frames_played = (guint64)(source_cursor_frame / rendered_to_source_ratio);
-  if (output_frames_played > playback_frames) {
-    output_frames_played = playback_frames;
-  }
+  core_playback_timeline_init(&timeline, cursor_frames, total_frames, playback_frames, rendered_to_source_ratio, 0);
+  final_cursor_frames = timeline.source_cursor_frame;
 
   g_printerr("[playback] source setup start=%.1f end=%" G_GUINT64_FORMAT " loop=%d region=%d\n",
-             source_cursor_frame, total_frames, loop_enabled ? 1 : 0, loop_region_set ? 1 : 0);
+             timeline.source_cursor_frame, total_frames, loop_enabled ? 1 : 0, loop_region_set ? 1 : 0);
 
   ss.format = PA_SAMPLE_S16LE;
   ss.rate = sample_rate;
@@ -1177,65 +1166,28 @@ static gpointer playback_thread_main(gpointer user_data) {
 
   {
     const guint frame_size = channels * sizeof(gint16);
-    gboolean loop_armed = FALSE;
-
     g_mutex_lock(&rec->mutex);
-    rec->playback_cursor_frames = source_cursor_frame;
-    rec->playback_anchor_frames = source_cursor_frame;
+    rec->playback_cursor_frames = timeline.source_cursor_frame;
+    rec->playback_anchor_frames = timeline.source_cursor_frame;
     rec->playback_anchor_us = g_get_monotonic_time();
-    rec->display_playhead_frames = source_cursor_frame;
+    rec->display_playhead_frames = timeline.source_cursor_frame;
     rec->mode = MODE_PLAYING;
     g_mutex_unlock(&rec->mutex);
     g_idle_add(refresh_ui_idle_cb, rec);
 
     while (1) {
       gboolean stop_requested;
-      gboolean live_loop_enabled = FALSE;
-      gboolean live_loop_region_set = FALSE;
-      gdouble live_loop_start = 0.0;
-      gdouble live_loop_end = 0.0;
-      guint64 live_loop_start_frame = 0;
-      guint64 live_loop_end_frame = 0;
-      gboolean live_loop_valid = FALSE;
+      LoopState live_loop = {0};
 
       g_mutex_lock(&rec->mutex);
-      live_loop_enabled = rec->loop.enabled;
-      live_loop_region_set = get_effective_loop_region_locked(rec, (gdouble)total_frames, &live_loop_start, &live_loop_end);
+      live_loop = rec->loop;
       g_mutex_unlock(&rec->mutex);
 
-      live_loop_start_frame = (guint64)live_loop_start;
-      live_loop_end_frame = (guint64)live_loop_end;
+      core_playback_timeline_update_loop(&timeline, &live_loop);
 
-      live_loop_valid = live_loop_enabled && live_loop_region_set && live_loop_end_frame > live_loop_start_frame;
-
-      if (live_loop_valid && loop_armed && source_cursor_frame >= (gdouble)live_loop_end_frame) {
-        source_cursor_frame = (gdouble)live_loop_start_frame;
-        final_cursor_frames = source_cursor_frame;
-        output_frames_played = (guint64)(source_cursor_frame / rendered_to_source_ratio);
-        if (output_frames_played > playback_frames) {
-          output_frames_played = playback_frames;
-        }
-        g_mutex_lock(&rec->mutex);
-        rec->playback_cursor_frames = source_cursor_frame;
-        rec->playback_anchor_frames = source_cursor_frame;
-        rec->playback_anchor_us = g_get_monotonic_time();
-        rec->display_playhead_frames = source_cursor_frame;
-        g_mutex_unlock(&rec->mutex);
-        g_idle_add(refresh_ui_idle_cb, rec);
-        continue;
-      }
-
-      if (!live_loop_valid) {
-        loop_armed = FALSE;
-      }
-
-      if (source_cursor_frame >= (gdouble)total_frames) {
+      if (core_playback_timeline_reached_end(&timeline)) {
         reached_end = TRUE;
         break;
-      }
-
-      if (live_loop_valid && source_cursor_frame < (gdouble)live_loop_end_frame) {
-        loop_armed = TRUE;
       }
 
       stop_requested = playback_should_stop(rec);
@@ -1250,33 +1202,13 @@ static gpointer playback_thread_main(gpointer user_data) {
       }
 
       guint writable = pa_stream_writable_size(stream);
-      guint out_frames = MIN(128u, writable / frame_size);
-      if (live_loop_valid && loop_armed && source_cursor_frame < (gdouble)live_loop_end_frame) {
-        guint64 loop_end_output_frame = (guint64)ceil((gdouble)live_loop_end_frame / rendered_to_source_ratio);
-        if (loop_end_output_frame < output_frames_played) {
-          loop_end_output_frame = output_frames_played;
-        }
-        if (output_frames_played + out_frames > loop_end_output_frame) {
-          out_frames = (guint)(loop_end_output_frame - output_frames_played);
-        }
-      }
+      guint out_frames = (guint)core_playback_timeline_limit_write_frames(&timeline, MIN(128u, writable / frame_size));
       if (out_frames == 0) {
-        if (live_loop_valid && loop_armed) {
-          source_cursor_frame = (gdouble)live_loop_end_frame;
-        }
         continue;
       }
 
-      if (output_frames_played + out_frames > playback_frames) {
-        out_frames = (guint)(playback_frames - output_frames_played);
-      }
-
-      if (out_frames == 0) {
-        break;
-      }
-
       if (pa_stream_write(stream,
-                          snapshot->data + (output_frames_played * frame_size),
+                          snapshot->data + (timeline.output_cursor_frame * frame_size),
                           out_frames * frame_size,
                           NULL,
                           0,
@@ -1285,14 +1217,10 @@ static gpointer playback_thread_main(gpointer user_data) {
         break;
       }
 
-      output_frames_played += out_frames;
-      source_cursor_frame = (gdouble)output_frames_played * rendered_to_source_ratio;
-      if (source_cursor_frame > (gdouble)total_frames) {
-        source_cursor_frame = (gdouble)total_frames;
-      }
+      core_playback_timeline_advance(&timeline, out_frames);
 
       g_mutex_lock(&rec->mutex);
-      rec->playback_cursor_frames = source_cursor_frame;
+      rec->playback_cursor_frames = timeline.source_cursor_frame;
       final_cursor_frames = rec->playback_cursor_frames;
       rec->playback_anchor_frames = rec->playback_cursor_frames;
       rec->playback_anchor_us = g_get_monotonic_time();
@@ -1392,33 +1320,29 @@ gboolean start_capture_thread(Recorder *r, gboolean reset_buffers) {
 }
 
 gboolean start_playback_thread(Recorder *r) {
+  RecorderCorePlaybackRequest request = {0};
+
   g_mutex_lock(&r->mutex);
-  if (r->playback_running) {
-    g_mutex_unlock(&r->mutex);
+  request = recorder_core_request_playback(&r->core, r->playback_running, g_get_monotonic_time());
+  g_mutex_unlock(&r->mutex);
+
+  if (request.already_playing) {
     return TRUE;
   }
 
-  if (r->audio.pcm->len == 0) {
-    g_mutex_unlock(&r->mutex);
+  if (!request.has_audio) {
     set_error(r, "Nothing has been recorded yet");
     return FALSE;
   }
-  g_mutex_unlock(&r->mutex);
 
-  g_mutex_lock(&r->mutex);
-  r->render_intent.should_play = TRUE;
-  g_mutex_unlock(&r->mutex);
-
-  if (!ensure_playback_buffer(r)) {
-    return FALSE;
-  }
-
-  g_mutex_lock(&r->mutex);
-  if (r->mode == MODE_RENDERING && r->render_pending) {
-    g_mutex_unlock(&r->mutex);
+  if (request.should_render) {
+    start_render_worker(r);
     return TRUE;
   }
-  g_mutex_unlock(&r->mutex);
+
+  if (request.render_pending && !request.buffer_ready) {
+    return TRUE;
+  }
 
   return start_playback_with_ready_buffer(r);
 }
@@ -1592,48 +1516,36 @@ static void transport_resume(Recorder *r) {
 }
 
 static void transport_set_speed(Recorder *r, gdouble speed) {
-  gboolean restart_playback = FALSE;
-  gboolean start_render = FALSE;
-  gboolean was_rendering = FALSE;
+  RecorderCoreSpeedChange change = {0};
   GThread *render_thread = NULL;
 
   g_mutex_lock(&r->mutex);
-  if (r->speed != speed) {
-    r->speed = speed;
-    invalidate_playback_buffer_locked(r);
-  }
-  restart_playback = (r->mode == MODE_PLAYING);
-  start_render = (r->mode == MODE_PAUSED || r->mode == MODE_IDLE);
-  was_rendering = (r->mode == MODE_RENDERING);
+  change = recorder_core_apply_speed_change(&r->core, speed);
   g_mutex_unlock(&r->mutex);
 
-  if (was_rendering) {
-    g_mutex_lock(&r->mutex);
-    render_thread = cancel_render_locked(r, r->render_source_mode);
-    g_mutex_unlock(&r->mutex);
-    if (render_thread) {
-      g_thread_unref(render_thread);
-    }
-    if (!ensure_playback_buffer(r)) {
-      set_error(r, "Failed to restart render after speed change");
-    }
-    refresh_ui(r);
+  if (!change.changed) {
     return;
   }
 
   update_speed_label(r, speed);
 
-  if (start_render) {
+  if (change.cancel_render) {
     g_mutex_lock(&r->mutex);
-    r->render_intent.should_play = FALSE;
+    render_thread = cancel_render_locked(r, change.cancel_next_mode);
     g_mutex_unlock(&r->mutex);
+    if (render_thread) {
+      g_thread_unref(render_thread);
+    }
+  }
+
+  if (change.start_render) {
     if (!ensure_playback_buffer(r)) {
-      set_error(r, "Failed to start render after speed change");
+      set_error(r, change.cancel_render ? "Failed to restart render after speed change" : "Failed to start render after speed change");
     }
     return;
   }
 
-  if (restart_playback) {
+  if (change.restart_playback) {
     if (r->platform.audio && r->platform.audio->stop_playback) {
       r->platform.audio->stop_playback(r->platform.backend.audio_user_data, FALSE);
     }

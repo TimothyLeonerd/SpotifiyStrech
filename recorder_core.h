@@ -35,6 +35,25 @@ typedef struct {
   gdouble seek_pos;
 } RecorderCoreRenderCompletion;
 
+typedef struct {
+  gboolean changed;
+  gboolean cancel_render;
+  AppMode cancel_next_mode;
+  gboolean start_render;
+  gboolean restart_playback;
+  gboolean render_should_play;
+  AppMode fallback_mode;
+} RecorderCoreSpeedChange;
+
+typedef struct {
+  gboolean has_audio;
+  gboolean already_playing;
+  gboolean buffer_ready;
+  gboolean render_pending;
+  gboolean should_render;
+  gboolean should_start_ready_buffer;
+} RecorderCorePlaybackRequest;
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -85,6 +104,13 @@ void recorder_core_clear_loop_drag(RecorderCore *core);
 void recorder_core_tick(RecorderCore *core, gdouble elapsed_seconds, gint64 now_us);
 gboolean recorder_core_playback_buffer_ready(const RecorderCore *core);
 void recorder_core_invalidate_playback_buffer(RecorderCore *core);
+RecorderCoreSpeedChange recorder_core_apply_speed_change(RecorderCore *core, gdouble speed);
+RecorderCorePlaybackRequest recorder_core_request_playback(RecorderCore *core,
+                                                           gboolean playback_running,
+                                                           gint64 now_us);
+gboolean recorder_core_begin_ready_playback(RecorderCore *core,
+                                           gboolean playback_running,
+                                           gint64 now_us);
 guint recorder_core_begin_render(RecorderCore *core, gint64 now_us);
 gboolean recorder_core_render_is_current(const RecorderCore *core, guint generation);
 void recorder_core_set_render_estimate(RecorderCore *core,

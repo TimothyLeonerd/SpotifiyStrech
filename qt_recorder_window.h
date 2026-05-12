@@ -78,7 +78,7 @@ class RecorderWindow : public QMainWindow {
   void refreshFromWindowsBackend();
   void updateSpeedLabel();
   void updatePlayPauseLabel();
-  void startWindowsPreparePlayback(bool restart_playback, AppMode fallback_mode);
+  void startWindowsPreparePlayback(bool restart_playback, AppMode fallback_mode, unsigned int generation = 0);
   void finishWindowsPreparePlayback(unsigned int generation, bool restart_playback, AppMode fallback_mode, bool prepared);
   void commitWindowsSpeedChange();
   void syncUi();
@@ -113,6 +113,7 @@ class RecorderWindow : public QMainWindow {
   gdouble &waveform_drag_offset_frames_ = recorder_.loop.drag_offset_frames;
   guint &windows_render_generation_ = recorder_.render_generation;
   gboolean &windows_rendering_ = recorder_.render_pending;
+  gdouble pending_speed_ = 1.0;
 
 #ifdef _WIN32
   PlatformWindowsContext windows_audio_context_{};

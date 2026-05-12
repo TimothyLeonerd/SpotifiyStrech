@@ -136,6 +136,22 @@ typedef struct {
   char text[512];
 } CoreStatusState;
 
+typedef struct {
+  gdouble rendered_to_source_ratio;
+  guint64 base_source_frame;
+  guint64 total_source_frames;
+  guint64 playback_frames;
+  guint64 output_cursor_frame;
+  gdouble source_cursor_frame;
+  gboolean loop_valid;
+  gboolean loop_armed;
+  gboolean loop_wrapped;
+  guint64 loop_start_source_frame;
+  guint64 loop_end_source_frame;
+  guint64 loop_start_output_frame;
+  guint64 loop_end_output_frame;
+} CorePlaybackTimeline;
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -222,6 +238,25 @@ gdouble core_update_display_playhead(AppMode mode,
                                       guint rate,
                                       gdouble speed,
                                       gint64 now_us);
+void core_playback_timeline_init(CorePlaybackTimeline *timeline,
+                                 gdouble start_source_frame,
+                                 guint64 total_source_frames,
+                                 guint64 playback_frames,
+                                 gdouble rendered_to_source_ratio,
+                                 guint64 base_source_frame);
+void core_playback_timeline_update_loop(CorePlaybackTimeline *timeline,
+                                        const LoopState *loop);
+guint64 core_playback_timeline_limit_write_frames(CorePlaybackTimeline *timeline,
+                                                  guint64 requested_frames);
+void core_playback_timeline_advance(CorePlaybackTimeline *timeline,
+                                    guint64 written_frames);
+gboolean core_playback_timeline_reached_end(const CorePlaybackTimeline *timeline);
+guint64 core_playback_timeline_rewind_output_cursor(guint64 tail_frame,
+                                                    guint64 queued_frames,
+                                                    guint64 loop_start_frame,
+                                                    guint64 loop_end_frame,
+                                                    gboolean loop_valid,
+                                                    gboolean loop_wrapped);
 
 #ifdef __cplusplus
 }

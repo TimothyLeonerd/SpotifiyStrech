@@ -62,6 +62,10 @@ The next architectural milestone is documented in `SHARED_RECORDER_REFACTOR_PLAN
 - [x] Windows playback cursor is derived from WASAPI queued padding during playback, so loop wraps report the audible position instead of the write-ahead cursor.
 - [x] Windows loop cursor math remains linear before the first actual queued loop wrap, so seeking before a loop does not display a circular-loop position early.
 - [x] Windows loop playback uses Linux-style temporary loop arming: seeking past loop end continues linearly instead of forcing an immediate wrap.
+- [x] Linux and Windows playback loops now use shared `CorePlaybackTimeline` stepping for source/output cursor conversion, loop arming, loop wrap, and end-of-playback detection.
+- [x] Linux and Windows speed changes now use shared `RecorderCoreSpeedChange` policy for invalidation, render restart, idle/paused pre-render, and active-playback restart decisions.
+- [x] Linux playback requests now use shared `RecorderCorePlaybackRequest`/ready-start policy, and Windows play-from-idle uses the same request policy before starting async prepare.
+- [x] Linux capture append now flows through `recorder_core_append_pcm`, matching Windows raw PCM append invalidation/captured-frame policy.
 
 ### Partial
 - [ ] Windows seek/scrub parity still needs runtime regression testing on real WASAPI output.
