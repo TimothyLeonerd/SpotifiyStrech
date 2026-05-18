@@ -78,8 +78,9 @@ class RecorderWindow : public QMainWindow {
   void refreshFromWindowsBackend();
   void updateSpeedLabel();
   void updatePlayPauseLabel();
-  void startWindowsPreparePlayback(bool restart_playback, AppMode fallback_mode, unsigned int generation = 0);
-  void finishWindowsPreparePlayback(unsigned int generation, bool restart_playback, AppMode fallback_mode, bool prepared);
+  void startWindowsPreparePlayback(AppMode fallback_mode, unsigned int generation = 0);
+  void finishWindowsPreparePlayback(unsigned int generation, AppMode fallback_mode, bool prepared);
+  bool startWindowsReadyPlayback(CorePlayPauseAction action);
   void commitWindowsSpeedChange();
   void syncUi();
 

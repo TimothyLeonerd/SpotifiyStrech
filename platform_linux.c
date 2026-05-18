@@ -51,7 +51,7 @@ static void linux_draw_waveform_peaks(cairo_t *cr, const guint16 *peaks, gsize p
 }
 
 static void linux_draw_loop_region(cairo_t *cr, const PlatformLoopSnapshot *loop, double width, double height) {
-  const gboolean active = loop->enabled || loop->explicit_region_set;
+  const gboolean active = loop->enabled;
   const double alpha = active ? 0.22 : 0.08;
   const double color = active ? 0.45 : 0.55;
   double start_x;
@@ -64,9 +64,11 @@ static void linux_draw_loop_region(cairo_t *cr, const PlatformLoopSnapshot *loop
   start_x = (loop->start_frames / loop->total_frames) * width;
   end_x = (loop->end_frames / loop->total_frames) * width;
 
-  cairo_set_source_rgba(cr, color, color, color, alpha);
-  cairo_rectangle(cr, start_x, 0, MAX(end_x - start_x, 0.0), height);
-  cairo_fill(cr);
+  if (active) {
+    cairo_set_source_rgba(cr, color, color, color, alpha);
+    cairo_rectangle(cr, start_x, 0, MAX(end_x - start_x, 0.0), height);
+    cairo_fill(cr);
+  }
 
   cairo_set_source_rgba(cr, color, color, color, active ? 0.55 : 0.20);
   cairo_set_line_width(cr, 3.0);

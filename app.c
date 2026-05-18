@@ -1413,6 +1413,7 @@ void stop_capture_thread(Recorder *r, gboolean force_stopped) {
 
 static void transport_stop(Recorder *r, const CoreTransportPlan *plan) {
   GThread *render_thread = NULL;
+  gboolean stopped_recording = FALSE;
 
   if (plan->should_cancel_render) {
     g_mutex_lock(&r->mutex);
@@ -1426,6 +1427,10 @@ static void transport_stop(Recorder *r, const CoreTransportPlan *plan) {
       r->platform.ui->set_progress_visible(r->platform.backend.user_data, FALSE);
     }
   } else {
+    g_mutex_lock(&r->mutex);
+    stopped_recording = plan->should_stop_capture && r->mode == MODE_RECORDING;
+    g_mutex_unlock(&r->mutex);
+
     if (plan->should_stop_playback) {
       if (r->platform.audio && r->platform.audio->stop_playback) {
         r->platform.audio->stop_playback(r->platform.backend.audio_user_data, !plan->preserve_cursor);
@@ -1438,7 +1443,14 @@ static void transport_stop(Recorder *r, const CoreTransportPlan *plan) {
     }
     g_mutex_lock(&r->mutex);
     recorder_core_apply_stop_plan(&r->core, plan, g_get_monotonic_time());
+    if (stopped_recording) {
+      recorder_core_materialize_loop_region(&r->core);
+    }
     g_mutex_unlock(&r->mutex);
+
+    if (stopped_recording && !ensure_playback_buffer(r)) {
+      set_error(r, "Failed to prepare playback after recording");
+    }
   }
   refresh_ui(r);
 }
@@ -1539,20 +1551,13 @@ static void transport_set_speed(Recorder *r, gdouble speed) {
   }
 
   if (change.start_render) {
+    if (r->platform.audio && r->platform.audio->stop_playback) {
+      r->platform.audio->stop_playback(r->platform.backend.audio_user_data, FALSE);
+    }
     if (!ensure_playback_buffer(r)) {
       set_error(r, change.cancel_render ? "Failed to restart render after speed change" : "Failed to start render after speed change");
     }
     return;
-  }
-
-  if (change.restart_playback) {
-    if (r->platform.audio && r->platform.audio->stop_playback) {
-      r->platform.audio->stop_playback(r->platform.backend.audio_user_data, FALSE);
-    }
-    if (!r->platform.audio || !r->platform.audio->start_playback || !r->platform.audio->start_playback(r->platform.backend.audio_user_data)) {
-      set_error(r, "Failed to restart playback at new speed");
-      refresh_ui(r);
-    }
   }
 }
 

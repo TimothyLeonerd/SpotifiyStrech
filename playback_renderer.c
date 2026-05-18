@@ -209,9 +209,12 @@ int playback_renderer_render_s16(const unsigned char *pcm,
       }
 
       if (progress_func && input_frames > 0) {
-        const double pass_base = pass == 0 ? 0.0 : 0.5;
+        const double study_weight = 0.10;
         const double pass_fraction = (double)offset / (double)input_frames;
-        progress_func(pass_base + (pass_fraction * 0.5), progress_user_data);
+        progress_func(pass == 0
+                        ? pass_fraction * study_weight
+                        : study_weight + (pass_fraction * (1.0 - study_weight)),
+                      progress_user_data);
       }
 
       fill_float_planes_from_s16(pcm, start_frame + offset, frames, channels, input_planes);

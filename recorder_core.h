@@ -40,7 +40,6 @@ typedef struct {
   gboolean cancel_render;
   AppMode cancel_next_mode;
   gboolean start_render;
-  gboolean restart_playback;
   gboolean render_should_play;
   AppMode fallback_mode;
 } RecorderCoreSpeedChange;
@@ -88,6 +87,7 @@ gboolean recorder_core_begin_scrub(RecorderCore *core, gboolean *out_resume_afte
 gboolean recorder_core_end_scrub(RecorderCore *core);
 void recorder_core_set_loop_enabled(RecorderCore *core, gboolean enabled);
 void recorder_core_set_loop_region(RecorderCore *core, gdouble start_frames, gdouble end_frames, gboolean set);
+void recorder_core_materialize_loop_region(RecorderCore *core);
 gdouble recorder_core_loop_min_width_frames(const RecorderCore *core);
 LoopSnapshot recorder_core_loop_snapshot(const RecorderCore *core);
 gdouble recorder_core_loop_start_ratio(const RecorderCore *core);
@@ -131,7 +131,6 @@ GByteArray *recorder_core_install_rendered_playback(RecorderCore *core,
 gboolean recorder_core_finish_render(RecorderCore *core,
                                      guint generation,
                                      gboolean prepared,
-                                     gboolean restart_playback,
                                      gboolean playback_started,
                                      AppMode fallback_mode);
 

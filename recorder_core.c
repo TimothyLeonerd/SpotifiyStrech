@@ -15,6 +15,9 @@ void recorder_core_init(RecorderCore *core, gint64 now_us) {
   core->audio.playback_rendered_to_source_ratio = 1.0;
   core->audio.playback_speed = 1.0;
   core->speed = 1.0;
+  core->loop.region_set = TRUE;
+  core->loop.start_ratio = 0.0;
+  core->loop.end_ratio = 1.0;
   core->playback_anchor_us = now_us;
   core->mode = MODE_IDLE;
   core->render_source_mode = MODE_IDLE;
@@ -204,8 +207,16 @@ void recorder_core_apply_stop_plan(RecorderCore *core, const CoreTransportPlan *
   }
 
   core->mode = plan->next_mode;
+  if (core->mode == MODE_RENDERING) {
+    core->render_intent.should_play = FALSE;
+  }
   if (!plan->preserve_cursor) {
     recorder_core_reset_playhead(core, 0.0, now_us);
+    if (core->mode == MODE_RENDERING) {
+      core->render_intent.seek_valid = TRUE;
+      core->render_intent.seek_pos = 0.0;
+      core->render_source_mode = MODE_IDLE;
+    }
   }
 }
 
@@ -261,6 +272,10 @@ void recorder_core_toggle_render_intent(RecorderCore *core) {
   }
 
   core->render_intent.should_play = !core->render_intent.should_play;
+  if (core->render_intent.should_play) {
+    core->render_intent.seek_valid = TRUE;
+    core->render_intent.seek_pos = core->display_playhead_frames;
+  }
 }
 
 gdouble recorder_core_seek_fraction(RecorderCore *core, gdouble fraction, gboolean update_render_intent) {
@@ -317,6 +332,8 @@ void recorder_core_set_loop_enabled(RecorderCore *core, gboolean enabled) {
 }
 
 void recorder_core_set_loop_region(RecorderCore *core, gdouble start_frames, gdouble end_frames, gboolean set) {
+  gdouble total_frames;
+
   if (!core) {
     return;
   }
@@ -336,6 +353,59 @@ void recorder_core_set_loop_region(RecorderCore *core, gdouble start_frames, gdo
   core->loop.region_set = set;
   core->loop.start_frames = start_frames;
   core->loop.end_frames = end_frames;
+  total_frames = recorder_core_captured_frames(core);
+  core->loop.start_ratio = total_frames > 0.0 ? start_frames / total_frames : 0.0;
+  core->loop.end_ratio = total_frames > 0.0 ? end_frames / total_frames : 1.0;
+}
+
+static gdouble recorder_core_clamp_ratio(gdouble ratio) {
+  if (ratio < 0.0) {
+    return 0.0;
+  }
+  if (ratio > 1.0) {
+    return 1.0;
+  }
+  return ratio;
+}
+
+static void recorder_core_set_loop_ratios(RecorderCore *core, gdouble start_ratio, gdouble end_ratio) {
+  gdouble total_frames;
+
+  if (!core) {
+    return;
+  }
+
+  start_ratio = recorder_core_clamp_ratio(start_ratio);
+  end_ratio = recorder_core_clamp_ratio(end_ratio);
+  core->loop.region_set = TRUE;
+  core->loop.start_ratio = start_ratio;
+  core->loop.end_ratio = end_ratio;
+
+  total_frames = recorder_core_captured_frames(core);
+  core->loop.start_frames = start_ratio * total_frames;
+  core->loop.end_frames = end_ratio * total_frames;
+}
+
+void recorder_core_materialize_loop_region(RecorderCore *core) {
+  gdouble total_frames;
+  gdouble start;
+  gdouble end;
+
+  if (!core) {
+    return;
+  }
+
+  total_frames = recorder_core_captured_frames(core);
+  start = core->loop.start_ratio * total_frames;
+  end = core->loop.end_ratio * total_frames;
+  if (start > end) {
+    gdouble tmp = start;
+    start = end;
+    end = tmp;
+  }
+  core->loop.region_set = TRUE;
+  core->loop.start_frames = start;
+  core->loop.end_frames = end;
 }
 
 gdouble recorder_core_loop_min_width_frames(const RecorderCore *core) {
@@ -344,21 +414,28 @@ gdouble recorder_core_loop_min_width_frames(const RecorderCore *core) {
 
 LoopSnapshot recorder_core_loop_snapshot(const RecorderCore *core) {
   LoopState empty = {0};
+  LoopState loop;
+  gdouble total_frames;
   if (!core) {
     return core_get_loop_snapshot(&empty, 0.0);
   }
 
-  return core_get_loop_snapshot(&core->loop, recorder_core_captured_frames(core));
+  total_frames = recorder_core_captured_frames(core);
+  loop = core->loop;
+  if (core->mode == MODE_RECORDING) {
+    loop.region_set = TRUE;
+    loop.start_frames = loop.start_ratio * total_frames;
+    loop.end_frames = loop.end_ratio * total_frames;
+  }
+  return core_get_loop_snapshot(&loop, total_frames);
 }
 
 gdouble recorder_core_loop_start_ratio(const RecorderCore *core) {
-  LoopSnapshot snapshot = recorder_core_loop_snapshot(core);
-  return snapshot.total_frames > 0.0 ? snapshot.start_frames / snapshot.total_frames : 0.0;
+  return core ? core->loop.start_ratio : 0.0;
 }
 
 gdouble recorder_core_loop_end_ratio(const RecorderCore *core) {
-  LoopSnapshot snapshot = recorder_core_loop_snapshot(core);
-  return snapshot.total_frames > 0.0 ? snapshot.end_frames / snapshot.total_frames : 1.0;
+  return core ? core->loop.end_ratio : 1.0;
 }
 
 CoreWaveformPressAction recorder_core_resolve_waveform_press(const RecorderCore *core,
@@ -369,12 +446,16 @@ CoreWaveformPressAction recorder_core_resolve_waveform_press(const RecorderCore 
   gdouble loop_end = 0.0;
   gboolean effective_region_set = FALSE;
   gdouble total_frames = recorder_core_captured_frames(core);
+  LoopSnapshot snapshot;
 
   if (!core) {
     return CORE_WAVEFORM_PRESS_IGNORE;
   }
 
-  effective_region_set = core_get_effective_loop_region(&core->loop, total_frames, &loop_start, &loop_end);
+  snapshot = recorder_core_loop_snapshot(core);
+  effective_region_set = snapshot.effective_region_set;
+  loop_start = snapshot.start_frames;
+  loop_end = snapshot.end_frames;
   return core_resolve_waveform_press(core->mode,
                                      shift,
                                      effective_region_set,
@@ -386,23 +467,28 @@ CoreWaveformPressAction recorder_core_resolve_waveform_press(const RecorderCore 
 gboolean recorder_core_begin_loop_drag(RecorderCore *core,
                                        CoreWaveformPressAction action,
                                        gdouble target_frames) {
+  gdouble total_frames;
+  gdouble target_ratio;
+
   if (!core) {
     return FALSE;
   }
 
+  total_frames = recorder_core_captured_frames(core);
+  target_ratio = total_frames > 0.0 ? target_frames / total_frames : 0.0;
+  target_ratio = recorder_core_clamp_ratio(target_ratio);
+
   switch (action) {
     case CORE_WAVEFORM_PRESS_LOOP_CREATE:
       core_set_loop_drag(&core->loop, LOOP_DRAG_CREATE, target_frames, 0.0);
-      core->loop.enabled = TRUE;
-      recorder_core_set_loop_region(core, target_frames, target_frames, TRUE);
+      core->loop.drag_anchor_ratio = target_ratio;
+      recorder_core_set_loop_ratios(core, target_ratio, target_ratio);
       return TRUE;
     case CORE_WAVEFORM_PRESS_LOOP_START:
       core_set_loop_drag(&core->loop, LOOP_DRAG_START, 0.0, 0.0);
-      core->loop.enabled = TRUE;
       return TRUE;
     case CORE_WAVEFORM_PRESS_LOOP_END:
       core_set_loop_drag(&core->loop, LOOP_DRAG_END, 0.0, 0.0);
-      core->loop.enabled = TRUE;
       return TRUE;
     default:
       return FALSE;
@@ -410,37 +496,46 @@ gboolean recorder_core_begin_loop_drag(RecorderCore *core,
 }
 
 gboolean recorder_core_update_loop_drag(RecorderCore *core, gdouble current_frames) {
-  gdouble loop_start = 0.0;
-  gdouble loop_end = 0.0;
   gdouble total_frames = recorder_core_captured_frames(core);
+  gdouble current_ratio;
 
   if (!core || core->loop.drag_mode == LOOP_DRAG_NONE) {
     return FALSE;
   }
 
-  core_get_effective_loop_region(&core->loop, total_frames, &loop_start, &loop_end);
-  if (!core_compute_loop_drag_region(core->loop.drag_mode,
-                                     core->loop.drag_anchor_frames,
-                                     core->loop.drag_offset_frames,
-                                     loop_start,
-                                     loop_end,
-                                     current_frames,
-                                     &loop_start,
-                                     &loop_end)) {
-    return FALSE;
-  }
+  current_ratio = total_frames > 0.0 ? current_frames / total_frames : 0.0;
+  current_ratio = recorder_core_clamp_ratio(current_ratio);
 
-  core_finalize_loop_region(&core->loop,
-                            total_frames,
-                            loop_start,
-                            loop_end,
-                            recorder_core_loop_min_width_frames(core));
-  return TRUE;
+  switch (core->loop.drag_mode) {
+    case LOOP_DRAG_CREATE:
+      recorder_core_set_loop_ratios(core, core->loop.drag_anchor_ratio, current_ratio);
+      return TRUE;
+    case LOOP_DRAG_START:
+      recorder_core_set_loop_ratios(core, current_ratio, core->loop.end_ratio);
+      return TRUE;
+    case LOOP_DRAG_END:
+      recorder_core_set_loop_ratios(core, core->loop.start_ratio, current_ratio);
+      return TRUE;
+    default:
+      return FALSE;
+  }
 }
 
 void recorder_core_clear_loop_drag(RecorderCore *core) {
+  gdouble start_ratio;
+  gdouble end_ratio;
+
   if (!core) {
     return;
+  }
+
+  start_ratio = core->loop.start_ratio;
+  end_ratio = core->loop.end_ratio;
+  if (start_ratio > end_ratio) {
+    gdouble tmp = start_ratio;
+    start_ratio = end_ratio;
+    end_ratio = tmp;
+    recorder_core_set_loop_ratios(core, start_ratio, end_ratio);
   }
 
   core_clear_loop_drag(&core->loop);
@@ -469,7 +564,10 @@ void recorder_core_tick(RecorderCore *core, gdouble elapsed_seconds, gint64 now_
 }
 
 gboolean recorder_core_playback_buffer_ready(const RecorderCore *core) {
-  return core && core->audio.playback_valid && core->audio.playback_pcm && core->audio.playback_speed == core->speed;
+  return core &&
+    core->audio.playback_valid &&
+    core->audio.playback_speed == core->speed &&
+    (core->audio.playback_pcm || core->portable_pcm_len > 0);
 }
 
 void recorder_core_invalidate_playback_buffer(RecorderCore *core) {
@@ -503,14 +601,17 @@ RecorderCoreSpeedChange recorder_core_apply_speed_change(RecorderCore *core, gdo
     change.start_render = TRUE;
     change.fallback_mode = core->render_source_mode;
   } else if (core->mode == MODE_PLAYING) {
-    change.restart_playback = TRUE;
+    change.start_render = TRUE;
     change.fallback_mode = MODE_PAUSED;
+    change.render_should_play = TRUE;
   } else if (core->mode == MODE_PAUSED || core->mode == MODE_IDLE) {
     change.start_render = TRUE;
     change.fallback_mode = core->mode;
   }
 
-  change.render_should_play = FALSE;
+  if (core->mode == MODE_RENDERING) {
+    change.render_should_play = core->render_intent.should_play;
+  }
   core->render_intent.should_play = change.render_should_play;
   return change;
 }
@@ -542,10 +643,7 @@ RecorderCorePlaybackRequest recorder_core_request_playback(RecorderCore *core,
   if (request.render_pending) {
     return request;
   }
-
-  recorder_core_begin_render(core, now_us);
-  request.render_pending = TRUE;
-  request.should_render = TRUE;
+  (void)now_us;
   return request;
 }
 
@@ -672,20 +770,40 @@ GByteArray *recorder_core_install_rendered_playback(RecorderCore *core,
 gboolean recorder_core_finish_render(RecorderCore *core,
                                      guint generation,
                                      gboolean prepared,
-                                     gboolean restart_playback,
                                      gboolean playback_started,
                                      AppMode fallback_mode) {
+  gboolean should_play;
+  gdouble seek_pos;
+
   if (!core || generation != core->render_generation) {
     return FALSE;
   }
 
+  should_play = core->render_intent.should_play;
+  if (core->render_intent.seek_valid) {
+    seek_pos = core->render_intent.seek_pos;
+    core_set_playback_cursor_state(seek_pos,
+                                   &core->playback_cursor_frames,
+                                   &core->playback_anchor_frames,
+                                   &core->playback_anchor_us,
+                                   &core->display_playhead_frames);
+  }
   core->render_pending = FALSE;
 
-  if (prepared && restart_playback) {
+  if (prepared) {
+    core->audio.playback_valid = TRUE;
+    core->audio.playback_speed = core->speed;
+  }
+
+  if (prepared && should_play) {
     core->mode = playback_started ? MODE_PLAYING : fallback_mode;
   } else {
-    core->mode = prepared ? fallback_mode : MODE_IDLE;
+    core->mode = prepared
+      ? ((core->render_source_mode == MODE_IDLE) ? MODE_IDLE : fallback_mode)
+      : MODE_IDLE;
   }
+  core->render_intent.should_play = FALSE;
+  core->render_intent.seek_valid = FALSE;
 
   return TRUE;
 }

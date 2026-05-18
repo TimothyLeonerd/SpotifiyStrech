@@ -185,8 +185,7 @@ CoreTransportPlan core_transport_stop_plan(AppMode mode, gboolean render_pending
   CoreTransportPlan plan = {0};
 
   if (render_pending) {
-    plan.should_cancel_render = TRUE;
-    plan.next_mode = MODE_IDLE;
+    plan.next_mode = MODE_RENDERING;
     return plan;
   }
 
@@ -346,6 +345,8 @@ void core_clear_loop_drag(LoopState *loop) {
   loop->drag_mode = LOOP_DRAG_NONE;
   loop->drag_anchor_frames = 0.0;
   loop->drag_offset_frames = 0.0;
+  loop->drag_anchor_ratio = 0.0;
+  loop->drag_offset_ratio = 0.0;
 }
 
 void core_finalize_loop_region(LoopState *loop, gdouble total_frames, gdouble start_frames, gdouble end_frames, gdouble min_width) {
@@ -383,10 +384,11 @@ void core_finalize_loop_region(LoopState *loop, gdouble total_frames, gdouble st
     }
   }
 
-  loop->enabled = TRUE;
   loop->region_set = TRUE;
   loop->start_frames = start;
   loop->end_frames = end;
+  loop->start_ratio = total_frames > 0.0 ? start / total_frames : 0.0;
+  loop->end_ratio = total_frames > 0.0 ? end / total_frames : 1.0;
 }
 
 void core_reset_recording_session(AudioBuffer *audio,
@@ -405,10 +407,16 @@ void core_reset_recording_session(AudioBuffer *audio,
 
   if (loop) {
     loop->enabled = FALSE;
-    loop->region_set = FALSE;
+    loop->region_set = TRUE;
+    loop->start_frames = 0.0;
+    loop->end_frames = 0.0;
+    loop->start_ratio = 0.0;
+    loop->end_ratio = 1.0;
     loop->drag_mode = LOOP_DRAG_NONE;
     loop->drag_anchor_frames = 0.0;
     loop->drag_offset_frames = 0.0;
+    loop->drag_anchor_ratio = 0.0;
+    loop->drag_offset_ratio = 0.0;
   }
 
   if (intent) {

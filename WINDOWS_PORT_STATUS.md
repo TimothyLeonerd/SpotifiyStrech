@@ -66,6 +66,9 @@ The next architectural milestone is documented in `SHARED_RECORDER_REFACTOR_PLAN
 - [x] Linux and Windows speed changes now use shared `RecorderCoreSpeedChange` policy for invalidation, render restart, idle/paused pre-render, and active-playback restart decisions.
 - [x] Linux playback requests now use shared `RecorderCorePlaybackRequest`/ready-start policy, and Windows play-from-idle uses the same request policy before starting async prepare.
 - [x] Linux capture append now flows through `recorder_core_append_pcm`, matching Windows raw PCM append invalidation/captured-frame policy.
+- [x] Loop markers now persist as always-visible marker positions; moving markers no longer enables loop playback, and loop fill/wrapping is controlled only by the Loop button.
+- [x] While recording, loop marker ratios remain visually stable and are materialized to audio frame positions when recording stops.
+- [x] Live loop-marker dragging is ratio-based and does not auto-expand close markers; start/end ordering is normalized only when dragging ends.
 
 ### Partial
 - [ ] Windows seek/scrub parity still needs runtime regression testing on real WASAPI output.

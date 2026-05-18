@@ -69,9 +69,13 @@ typedef struct {
   gboolean region_set;
   gdouble start_frames;
   gdouble end_frames;
+  gdouble start_ratio;
+  gdouble end_ratio;
   LoopDragMode drag_mode;
   gdouble drag_anchor_frames;
   gdouble drag_offset_frames;
+  gdouble drag_anchor_ratio;
+  gdouble drag_offset_ratio;
 } LoopState;
 
 typedef struct {
